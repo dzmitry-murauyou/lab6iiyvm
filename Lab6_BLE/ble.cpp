@@ -34,6 +34,7 @@
 #include "ble.h"
 
 #include "crc32.h"
+#include "protocol.h"
 
 #include <objbase.h>
 
@@ -189,45 +190,17 @@ std::wstring TimeText(double seconds) {
     return Format(L"~%d ч %02d мин", total / 3600, (total % 3600) / 60);
 }
 
-unsigned long long ParseUll(std::wstring const& text) {
-    unsigned long long value = 0;
-    for (wchar_t ch : text) {
-        if (ch < L'0' || ch > L'9') break;
-        value = value * 10 + (unsigned long long)(ch - L'0');
-    }
-    return value;
-}
-
-std::vector<std::wstring> Split(std::wstring const& text, wchar_t sep, size_t limit) {
-    std::vector<std::wstring> parts;
-    size_t start = 0;
-    while (start <= text.size()) {
-        size_t pos = text.find(sep, start);
-        if (pos == std::wstring::npos || (limit && parts.size() + 1 >= limit)) {
-            parts.push_back(text.substr(start));
-            break;
-        }
-        parts.push_back(text.substr(start, pos - start));
-        start = pos + 1;
-    }
-    return parts;
-}
+// Разбор строк протокола и кадры Data — общие с автотестами (protocol.h).
+using ble::proto::DecodeFrame;
+using ble::proto::EncodeFrame;
+using ble::proto::kMaxFileSize;
+using ble::proto::ParseUll;
+using ble::proto::SanitizeName;
+using ble::proto::Split;
 
 std::wstring FileNamePart(std::wstring const& path) {
     const size_t pos = path.find_last_of(L"\\/");
     return pos == std::wstring::npos ? path : path.substr(pos + 1);
-}
-
-std::wstring SanitizeName(std::wstring name) {
-    for (wchar_t& ch : name) {
-        if (ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' ||
-            ch == L'<' || ch == L'>' || ch == L'|' || ch < 32) {
-            ch = L'_';
-        }
-    }
-    if (name.empty() || name == L"." || name == L"..") name = L"received.bin";
-    if (name.size() > 96) name = name.substr(0, 96);
-    return name;
 }
 
 std::wstring JoinPath(std::wstring const& dir, std::wstring const& name) {
@@ -385,6 +358,7 @@ struct Engine::Impl {
     bool connected = false;
 
     std::uint64_t target = 0;
+    int target_type = 0;
     std::wstring target_name;
     unsigned long long acked = 0;
     unsigned long long ack_count = 0;
@@ -527,6 +501,7 @@ struct Engine::Impl {
 
     void OnAdvertisement(BluetoothLEAdvertisementReceivedEventArgs const& args) {
         const std::uint64_t address = args.BluetoothAddress();
+        const int address_type = (int)args.BluetoothAddressType();
         const int rssi = (int)args.Rssi();
         std::wstring name = args.Advertisement().LocalName().c_str();
         bool has_service = false;
@@ -554,6 +529,7 @@ struct Engine::Impl {
             if (!found) {
                 DeviceInfo info;
                 info.address = address;
+                info.address_type = address_type;
                 info.name = name;
                 info.rssi = rssi;
                 info.has_service = has_service;
@@ -677,14 +653,18 @@ struct Engine::Impl {
         inbox.clear();
     }
 
-    bool TryConnect(std::uint64_t address) {
+    bool TryConnect(std::uint64_t address, int address_type) {
         ResetLink();
 
         SetLink(LinkConnecting, L"Подключение…");
         Log(0, L"Подключение к " + MacText(address) + L"…");
 
         try {
-            BluetoothLEDevice dev = BluetoothLEDevice::FromBluetoothAddressAsync(address).get();
+            // Тип адреса важен: смартфоны и трекеры рекламируются со случайным
+            // (random) адресом, и подключение по одному числу не сработает.
+            const BluetoothAddressType type =
+                address_type == 1 ? BluetoothAddressType::Random : BluetoothAddressType::Public;
+            BluetoothLEDevice dev = BluetoothLEDevice::FromBluetoothAddressAsync(address, type).get();
             if (!dev) {
                 Log(2, L"Устройство не найдено (возможно, выключено)");
                 return false;
@@ -777,6 +757,7 @@ struct Engine::Impl {
                 ack_count = 0;
                 inbox.clear();
                 target = address;
+                target_type = address_type;
                 target_name = name;
                 mtu = pdu;
                 payload = chunk;
@@ -874,9 +855,9 @@ struct Engine::Impl {
         }
     }
 
-    void ConnectJob(std::uint64_t address) {
+    void ConnectJob(std::uint64_t address, int address_type) {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        const bool ok = TryConnect(address);
+        const bool ok = TryConnect(address, address_type);
         if (!ok) {
             Edit([](Stats& s) {
                 s.connected = false;
@@ -920,12 +901,8 @@ struct Engine::Impl {
         }
         if (!ch) return false;
 
-        std::vector<std::uint8_t> frame(size + 4);
-        frame[0] = (std::uint8_t)(offset & 0xFF);
-        frame[1] = (std::uint8_t)((offset >> 8) & 0xFF);
-        frame[2] = (std::uint8_t)((offset >> 16) & 0xFF);
-        frame[3] = (std::uint8_t)((offset >> 24) & 0xFF);
-        if (size) memcpy(frame.data() + 4, data, size);
+        std::vector<std::uint8_t> frame;
+        EncodeFrame(offset, data, size, frame);
 
         try {
             auto result = ch.WriteValueWithResultAsync(ToBuffer(frame.data(), frame.size()),
@@ -977,12 +954,21 @@ struct Engine::Impl {
                       std::uint32_t crc) {
         ResetInbox();
 
-        if (!WriteControl(Format(L"START|%llu|%08X|%s", size, crc, name.c_str()))) {
-            throw LinkLost("START не отправлен");
-        }
-
+        // START идемпотентен (приёмник отвечает уже принятым смещением),
+        // поэтому его безопасно повторить, если уведомление потерялось.
         std::wstring line;
-        if (!WaitStatus(L"READY|", line, 12000)) throw LinkLost("нет ответа READY");
+        bool ready = false;
+        for (int attempt = 0; attempt < 3 && !ready; ++attempt) {
+            if (!WriteControl(Format(L"START|%llu|%08X|%s", size, crc, name.c_str()))) {
+                throw LinkLost("START не отправлен");
+            }
+            ready = WaitStatus(L"READY|", line, 4000);
+            if (!ready) {
+                if (cancel.load()) throw Cancelled();
+                if (attempt < 2) Log(1, L"Нет ответа на START, повтор…");
+            }
+        }
+        if (!ready) throw LinkLost("приёмник не ответил на START");
         unsigned long long offset = ParseUll(line.substr(6));
         if (offset > size) offset = 0;
 
@@ -1073,8 +1059,11 @@ struct Engine::Impl {
         }
         CloseHandle(file);
 
-        // Ждём, пока приёмник подтвердит последние блоки.
+        // Ждём подтверждения последних блоков. Приёмник подтверждает раз в
+        // 8 КБ/100 мс, поэтому для маленького файла последний ACK мог ещё не
+        // прийти — просим SYNC, чтобы не ждать таймаут зря.
         const unsigned long long wait_start = GetTickCount64();
+        unsigned long long last_sync = 0;
         for (;;) {
             if (cancel.load()) throw Cancelled();
             unsigned long long ack_now = 0;
@@ -1084,6 +1073,10 @@ struct Engine::Impl {
             }
             if (ack_now >= size) break;
             if (GetTickCount64() - wait_start > 8000) throw Stall("последние блоки не подтверждены");
+            if (ack_now < size && GetTickCount64() - last_sync >= 400) {
+                last_sync = GetTickCount64();
+                WriteControl(L"SYNC");
+            }
             {
                 std::unique_lock<std::mutex> lock(snd_mu);
                 snd_cv.wait_for(lock, 100ms);
@@ -1124,7 +1117,7 @@ struct Engine::Impl {
         return ok;
     }
 
-    void SendJob(std::wstring path, std::uint64_t address) {
+    void SendJob(std::wstring path, std::uint64_t address, int address_type) {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
         send_busy.store(true);
         cancel.store(false);
@@ -1144,7 +1137,7 @@ struct Engine::Impl {
             winrt::uninit_apartment();
             return;
         }
-        if (size > 0xFFFFFFFFull) {
+        if (size > kMaxFileSize) {
             Log(2, L"Файл больше 4 ГБ — формат кадра это не поддерживает");
             Edit([](Stats& s) {
                 s.transfer = TrFailed;
@@ -1183,7 +1176,7 @@ struct Engine::Impl {
         for (int attempt = 0; attempt <= kMaxAttempts && !cancel.load(); ++attempt) {
             JoinThread(link_thread);
             if (!connected) {
-                if (!TryConnect(address)) {
+                if (!TryConnect(address, address_type)) {
                     if (cancel.load()) break;
                     link_failed = true;
                     SleepCancelable(1800);
@@ -1355,7 +1348,7 @@ struct Engine::Impl {
                 } else {
                     s.status = L"Ожидание подключения…";
                 }
-                s.link = LinkAdvertising;
+                s.link = s.transfer == TrPaused ? LinkPaused : LinkAdvertising;
             });
         }
     }
@@ -1385,6 +1378,8 @@ struct Engine::Impl {
             FinishSession(parts);
         } else if (parts[0] == L"ABORT") {
             AbortSession();
+        } else if (parts[0] == L"SYNC") {
+            SyncStatus();
         } else {
             NotifyStatus(L"ERR|неизвестная команда");
         }
@@ -1554,6 +1549,16 @@ struct Engine::Impl {
         (void)received;
     }
 
+    // Отправитель просит прислать текущее смещение (например, перед END).
+    void SyncStatus() {
+        unsigned long long received = 0;
+        {
+            std::lock_guard<std::mutex> lock(recv_mu);
+            received = r_has ? r_received : 0;
+        }
+        NotifyStatus(Format(L"ACK|%llu", received));
+    }
+
     void AbortSession() {
         {
             std::lock_guard<std::mutex> lock(recv_mu);
@@ -1576,11 +1581,10 @@ struct Engine::Impl {
     }
 
     void HandleData(std::vector<std::uint8_t> const& bytes) {
-        if (bytes.size() < 5) return;
-        const std::uint32_t offset = (std::uint32_t)bytes[0] | ((std::uint32_t)bytes[1] << 8) |
-                                     ((std::uint32_t)bytes[2] << 16) |
-                                     ((std::uint32_t)bytes[3] << 24);
-        const std::size_t count = bytes.size() - 4;
+        std::uint32_t offset = 0;
+        const std::uint8_t* payload = nullptr;
+        std::size_t count = 0;
+        if (!DecodeFrame(bytes.data(), bytes.size(), offset, payload, count)) return;
 
         bool need_ack = false;
         bool progress = false;
@@ -1596,7 +1600,7 @@ struct Engine::Impl {
                 acknowledged = r_received;
             } else {
                 DWORD written = 0;
-                const BOOL ok = WriteFile(file, bytes.data() + 4, (DWORD)count, &written, nullptr);
+                const BOOL ok = WriteFile(file, payload, (DWORD)count, &written, nullptr);
                 if (ok && written == count) {
                     r_received += written;
                     ++r_chunks;
@@ -2013,13 +2017,15 @@ bool Engine::Connect(std::size_t index) {
     {
         std::lock_guard<std::mutex> lock(d.snd_mu);
         d.target = list[index].address;
+        d.target_type = list[index].address_type;
         d.target_name = list[index].name;
     }
 
     const std::uint64_t address = list[index].address;
-    d.link_thread = std::thread([&d, address] {
+    const int address_type = list[index].address_type;
+    d.link_thread = std::thread([&d, address, address_type] {
         try {
-            d.ConnectJob(address);
+            d.ConnectJob(address, address_type);
         } catch (...) {
             d.link_busy.store(false);
         }
@@ -2070,9 +2076,11 @@ bool Engine::StartSend(const std::wstring& path) {
     }
 
     std::uint64_t address = 0;
+    int address_type = 0;
     {
         std::lock_guard<std::mutex> lock(d.snd_mu);
         address = d.target;
+        address_type = d.target_type;
     }
     if (address == 0) {
         d.Log(2, L"Сначала выберите устройство в списке и подключитесь");
@@ -2082,9 +2090,9 @@ bool Engine::StartSend(const std::wstring& path) {
 
     d.cancel.store(false);
     JoinThread(d.send_thread);
-    d.send_thread = std::thread([&d, path, address] {
+    d.send_thread = std::thread([&d, path, address, address_type] {
         try {
-            d.SendJob(path, address);
+            d.SendJob(path, address, address_type);
         } catch (...) {
             d.send_busy.store(false);
         }

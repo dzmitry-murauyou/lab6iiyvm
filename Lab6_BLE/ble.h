@@ -55,6 +55,7 @@ constexpr UINT kUpdateMessage = WM_APP + 42;
 
 struct DeviceInfo {
     std::uint64_t address = 0;
+    int address_type = 0;       // 0 — public, 1 — random (BluetoothAddressType)
     std::wstring name;
     int rssi = -127;
     bool has_service = false;   // в рекламе есть UUID нашего сервиса
