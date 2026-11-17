@@ -98,7 +98,7 @@ READY|…  DONE|…  ABORTED  ERR|…
 нагрузкой «Разработка классических приложений на C++» и компонентом
 **C++/WinRT**, Windows SDK 10.0.17763 или новее.
 
-1. Открыть `Lab6_BLE.vcxproj` (или добавить его в решение).
+1. Открыть `Lab6_BLE.sln` (или сам `Lab6_BLE.vcxproj`).
 2. Выбрать `x64` и `Debug`/`Release`, собрать (`Ctrl+Shift+B`).
 3. Готовый файл — `bin\x64\<конфигурация>\Lab6_BLE.exe`.
 
@@ -108,6 +108,15 @@ READY|…  DONE|…  ABORTED  ERR|…
 Если VS не находит C++/WinRT-проекцию, установите компонент
 «C++/WinRT» в Visual Studio Installer либо NuGet-пакет
 `Microsoft.Windows.CppWinRT`.
+
+### Особенности, уже учтённые в проекте
+
+| Симптом при сборке | Причина и что сделано |
+|---|---|
+| `static assertion failed: STL1011 … /await … <experimental/resumable> deprecated` | заголовки C++/WinRT подтягивают экспериментальные корутины; в проекте задан `_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS` и `stdcpp17` |
+| `непредвиденный здесь элемент "IInspectable"` | в обработчиках событий C++/WinRT второй параметр имеет тип `Windows::Foundation::IInspectable`; он указан полностью, без `using namespace` |
+| `'Rssi' не является членом BluetoothLEAdvertisementReceivedEventArgs` | в WinRT свойство называется `RawSignalStrengthInDBm()` |
+| `GetOpenFileNameW`/`OPENFILENAMEW`/`OFN_*` не объявлены | нужен `<commdlg.h>` — подключён в `main.cpp` |
 
 ---
 

@@ -502,7 +502,7 @@ struct Engine::Impl {
     void OnAdvertisement(BluetoothLEAdvertisementReceivedEventArgs const& args) {
         const std::uint64_t address = args.BluetoothAddress();
         const int address_type = (int)args.BluetoothAddressType();
-        const int rssi = (int)args.Rssi();
+        const int rssi = (int)args.RawSignalStrengthInDBm();
         std::wstring name = args.Advertisement().LocalName().c_str();
         bool has_service = false;
         try {
@@ -764,7 +764,7 @@ struct Engine::Impl {
             }
 
             device_token = dev.ConnectionStatusChanged(
-                [this](BluetoothLEDevice const& d, IInspectable const&) {
+                [this](BluetoothLEDevice const& d, winrt::Windows::Foundation::IInspectable const&) {
                     OnDeviceConnectionChanged(d.ConnectionStatus());
                 });
 
@@ -1742,7 +1742,7 @@ struct Engine::Impl {
                     OnStatusRead(args);
                 });
             t_subs = status_local.SubscribedClientsChanged(
-                [this](GattLocalCharacteristic const&, IInspectable const&) {
+                [this](GattLocalCharacteristic const&, winrt::Windows::Foundation::IInspectable const&) {
                     OnSubscribersChanged();
                 });
 

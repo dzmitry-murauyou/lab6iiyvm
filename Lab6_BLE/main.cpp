@@ -16,6 +16,7 @@
 #include "visual.h"
 
 #include <commctrl.h>
+#include <commdlg.h>
 #include <knownfolders.h>
 #include <objbase.h>
 #include <shellapi.h>
