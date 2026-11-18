@@ -578,6 +578,9 @@ private:
                            (unsigned)((device.address >> 16) & 0xFF),
                            (unsigned)((device.address >> 8) & 0xFF),
                            (unsigned)(device.address & 0xFF));
+            // Тип BLE-адреса: public выдаётся производителем, random генерирует
+            // хост (смартфоны, трекеры) — полезно при идентификации устройства.
+            if (device.address_type == 1) text += L"  (random)";
             if (device.has_service) text += L"   •  Lab6";
             SendMessageW(view_.DeviceCombo(), CB_ADDSTRING, 0, (LPARAM)text.c_str());
         }
