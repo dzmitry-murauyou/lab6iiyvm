@@ -454,8 +454,64 @@ struct Engine::Impl {
     // =======================================================================
     //  СКАНИРОВАНИЕ (Central)
     // =======================================================================
+    // Возможности Bluetooth-адаптера. Нужны, чтобы отличить «нет адаптера»,
+    // «адаптер без BLE» и «адаптер без роли Peripheral» (частый случай у
+    // дешёвых USB-донглов со сторонним стеком: реклама и GATT-сервер в этом
+    // случае недоступны, и без этой проверки пользователь увидит лишь
+    // невнятную ошибку HRESULT).
+    BluetoothAdapter GetAdapter() {
+        try {
+            return BluetoothAdapter::GetDefaultAsync().get();
+        } catch (...) {
+            return nullptr;
+        }
+    }
+
+    // Проверяет адаптер и пишет его возможности в журнал.
+    // need_peripheral — требуем роль Peripheral (приёмник).
+    bool CheckAdapter(bool need_peripheral) {
+        BluetoothAdapter adapter = GetAdapter();
+        if (!adapter) {
+            Log(3, L"Bluetooth-адаптер не найден. Подключите адаптер и включите Bluetooth.");
+            SetLink(LinkError, L"Нет Bluetooth-адаптера");
+            return false;
+        }
+
+        const bool le = adapter.IsLowEnergySupported();
+        const bool central = adapter.IsCentralRoleSupported();
+        const bool peripheral = adapter.IsPeripheralRoleSupported();
+        const bool multi = adapter.IsMultiAdvertisementSupported();
+
+        Log(0, Format(L"Адаптер: BLE — %s, Central — %s, Peripheral — %s, несколько реклам — %s",
+                      le ? L"да" : L"нет", central ? L"да" : L"нет", peripheral ? L"да" : L"нет",
+                      multi ? L"да" : L"нет"));
+
+        if (!le) {
+            Log(3, L"Bluetooth Low Energy не поддерживается этим адаптером.");
+            SetLink(LinkError, L"Нет поддержки BLE");
+            return false;
+        }
+        if (need_peripheral && !peripheral) {
+            Log(3, L"Адаптер не поддерживает роль Peripheral: реклама и GATT-сервер недоступны. "
+                   L"Нужен встроенный адаптер с драйвером Microsoft (USB-донглы со сторонним "
+                   L"стеком ролью Peripheral не обладают).");
+            SetLink(LinkError, L"Роль Peripheral не поддерживается");
+            return false;
+        }
+        if (!need_peripheral && !central) {
+            Log(3, L"Адаптер не поддерживает роль Central (GATT-клиент).");
+            SetLink(LinkError, L"Роль Central не поддерживается");
+            return false;
+        }
+        return true;
+    }
+
     void ScanMain() {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        if (!CheckAdapter(false)) {
+            winrt::uninit_apartment();
+            return;
+        }
         try {
             BluetoothLEAdvertisementWatcher watcher;
             watcher.ScanningMode(BluetoothLEScanningMode::Active);
@@ -1668,6 +1724,10 @@ struct Engine::Impl {
 
     void ReceiverMain() {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        if (!CheckAdapter(true)) {
+            winrt::uninit_apartment();
+            return;
+        }
 
         GattServiceProvider provider_local = nullptr;
         GattLocalCharacteristic ctrl_local = nullptr;
