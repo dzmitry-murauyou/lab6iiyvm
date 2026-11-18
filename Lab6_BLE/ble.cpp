@@ -480,11 +480,9 @@ struct Engine::Impl {
         const bool le = adapter.IsLowEnergySupported();
         const bool central = adapter.IsCentralRoleSupported();
         const bool peripheral = adapter.IsPeripheralRoleSupported();
-        const bool multi = adapter.IsMultiAdvertisementSupported();
 
-        Log(0, Format(L"Адаптер: BLE — %s, Central — %s, Peripheral — %s, несколько реклам — %s",
-                      le ? L"да" : L"нет", central ? L"да" : L"нет", peripheral ? L"да" : L"нет",
-                      multi ? L"да" : L"нет"));
+        Log(0, Format(L"Адаптер: BLE — %s, Central — %s, Peripheral — %s",
+                      le ? L"да" : L"нет", central ? L"да" : L"нет", peripheral ? L"да" : L"нет"));
 
         if (!le) {
             Log(3, L"Bluetooth Low Energy не поддерживается этим адаптером.");

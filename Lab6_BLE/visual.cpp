@@ -51,7 +51,7 @@ const int FileH = 156;
 const int PanelW = 352;
 const int RowH = 22;
 const int InnerPad = 16;
-const REAL Radius = 6.0f;
+const int Radius = 6;   // в DIP; масштабируется через S(), поэтому целое
 
 }  // namespace theme
 

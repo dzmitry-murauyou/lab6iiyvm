@@ -117,6 +117,8 @@ READY|…  DONE|…  ABORTED  ERR|…
 | `непредвиденный здесь элемент "IInspectable"` | в обработчиках событий C++/WinRT второй параметр имеет тип `Windows::Foundation::IInspectable`; он указан полностью, без `using namespace` |
 | `'Rssi' не является членом BluetoothLEAdvertisementReceivedEventArgs` | в WinRT свойство называется `RawSignalStrengthInDBm()` |
 | `GetOpenFileNameW`/`OPENFILENAMEW`/`OFN_*` не объявлены | нужен `<commdlg.h>` — подключён в `main.cpp` |
+| `'IsMultiAdvertisementSupported' не является членом BluetoothAdapter` | такого свойства в WinRT нет (есть `IsAdvertisementOffloadSupported`); в журнал выводятся BLE/Central/Peripheral |
+| `аргумент: преобразование "float" в "int"` ×8 | `theme::Radius` был `float`, а `S()` принимает DIP-целое; радиус объявлен как `int`, деление идёт после `S()` |
 
 ---
 
