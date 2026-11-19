@@ -143,6 +143,18 @@ constexpr int kMaxPdu = 517;                     // практический м�
 // Окно неподтверждённых данных. Write Without Response не повторяет записи:
 // если залить больше, чем буфер приёмника, блоки теряются и передача встаёт
 // на бесконечных пересылках. Поэтому окно маленькое и адаптивное.
+// Ожидание асинхронной операции с предельным временем. Без этого вызов
+// WinRT может «зависнуть» навсегда (так и было с подключением), и приложение
+// оставалось в состоянии «Подключение…» до перезапуска.
+template <typename Op>
+bool AwaitOp(Op const& op, unsigned ms) {
+    try {
+        return op.wait_for(std::chrono::milliseconds(ms)) == winrt::AsyncStatus::Completed;
+    } catch (...) {
+        return false;
+    }
+}
+
 inline unsigned long long NowUs() {
     return (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -409,6 +421,7 @@ struct Engine::Impl {
     std::atomic<bool> recv_stop{false};
     std::atomic<bool> send_busy{false};
     std::atomic<bool> link_busy{false};
+    std::atomic<unsigned long long> link_busy_since{0};   // чтобы не залипнуть навсегда
     std::atomic<bool> scan_active{false};   // поток сканирования уже запущен
     std::atomic<bool> recv_active{false};   // поток GATT-сервера уже запущен
 
@@ -1076,7 +1089,19 @@ struct Engine::Impl {
             // подключению — несколько попыток с паузой заметно надёжнее.
             BluetoothLEDevice dev = nullptr;
             for (int attempt = 0; attempt < 3 && !dev; ++attempt) {
-                dev = BluetoothLEDevice::FromBluetoothAddressAsync(address, type).get();
+                Log(4, Format(L"шаг: устройство (MAC %s, попытка %d)",
+                              MacText(address).c_str(), attempt + 1));
+                auto op = BluetoothLEDevice::FromBluetoothAddressAsync(address, type);
+                if (!AwaitOp(op, 5000)) {
+                    Log(1, Format(L"Устройство MAC %s не отвечает (попытка %d, 5 с)",
+                                  MacText(address).c_str(), attempt + 1));
+                    try {
+                        op.Cancel();
+                    } catch (...) {
+                    }
+                } else {
+                    dev = op.get();
+                }
                 if (!dev && attempt < 2) SleepCancelable(400);
             }
             if (!dev) {
@@ -1085,18 +1110,19 @@ struct Engine::Impl {
                 return false;
             }
 
-            // Просим у стека «скоростной» профиль соединения: интервал
-            // 11.25–15 мс вместо обычных 30–150 мс. Это только просьба, и
-            // ошибку не показываем — в журнале от неё только шум.
-            try {
-                dev.RequestPreferredConnectionParameters(
-                    BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
-            } catch (...) {
-            }
-
             GattSession sess = nullptr;
+            Log(4, L"шаг: сеанс GATT");
             try {
-                sess = GattSession::FromDeviceIdAsync(dev.BluetoothDeviceId()).get();
+                auto sop = GattSession::FromDeviceIdAsync(dev.BluetoothDeviceId());
+                if (!AwaitOp(sop, 5000)) {
+                    Log(1, L"Сеанс GATT не открылся за 5 с · MAC " + MacText(address));
+                    try {
+                        sop.Cancel();
+                    } catch (...) {
+                    }
+                } else {
+                    sess = sop.get();
+                }
                 if (sess) sess.MaintainConnection(true);
             } catch (...) {
                 Log(1, L"Не удалось удержать соединение (GattSession), MAC " +
@@ -1110,15 +1136,38 @@ struct Engine::Impl {
                 const BluetoothCacheMode mode =
                     attempt == 0 ? BluetoothCacheMode::Uncached : BluetoothCacheMode::Cached;
                 GattCommunicationStatus status = GattCommunicationStatus::Unreachable;
+                Log(4, Format(L"шаг: поиск сервиса (попытка %d)", attempt + 1));
                 try {
-                    auto result = dev.GetGattServicesForUuidAsync(ServiceUuid(), mode).get();
+                    auto sop = dev.GetGattServicesForUuidAsync(ServiceUuid(), mode);
+                    if (!AwaitOp(sop, 8000)) {
+                        Log(1, Format(L"Сервис не ответил за 8 с (MAC %s, попытка %d)",
+                                      MacText(address).c_str(), attempt + 1));
+                        try {
+                            sop.Cancel();
+                        } catch (...) {
+                        }
+                        if (attempt < 2) SleepCancelable(400);
+                        continue;
+                    }
+                    auto result = sop.get();
                     status = result.Status();
                     if (status == GattCommunicationStatus::Success &&
                         result.Services().Size() > 0) {
                         svc = result.Services().GetAt(0);
                     }
                     if (!svc) {
-                        auto all = dev.GetGattServicesAsync(mode).get();
+                        auto aop = dev.GetGattServicesAsync(mode);
+                        if (!AwaitOp(aop, 8000)) {
+                            Log(1, Format(L"Список сервисов не ответил за 8 с (MAC %s)",
+                                          MacText(address).c_str()));
+                            try {
+                                aop.Cancel();
+                            } catch (...) {
+                            }
+                            if (attempt < 2) SleepCancelable(400);
+                            continue;
+                        }
+                        auto all = aop.get();
                         status = all.Status();
                         if (status == GattCommunicationStatus::Success) {
                             for (auto const& candidate : all.Services()) {
@@ -1147,9 +1196,17 @@ struct Engine::Impl {
                 return false;
             }
 
-            auto chars = svc.GetCharacteristicsAsync(BluetoothCacheMode::Uncached).get();
+            Log(4, L"шаг: характеристики");
+            auto cop = svc.GetCharacteristicsAsync(BluetoothCacheMode::Uncached);
+            if (!AwaitOp(cop, 6000)) {
+                Log(2, L"Характеристики не ответили за 6 с · MAC " + MacText(address));
+                ResetLink();
+                return false;
+            }
+            auto chars = cop.get();
             if (chars.Status() != GattCommunicationStatus::Success) {
-                chars = svc.GetCharacteristicsAsync(BluetoothCacheMode::Cached).get();
+                auto cop2 = svc.GetCharacteristicsAsync(BluetoothCacheMode::Cached);
+                if (AwaitOp(cop2, 6000)) chars = cop2.get();
             }
             if (chars.Status() != GattCommunicationStatus::Success) {
                 Log(2, Format(L"Не удалось получить характеристики на MAC %s: %s",
@@ -1182,9 +1239,15 @@ struct Engine::Impl {
                 return false;
             }
 
-            auto sub = stat.WriteClientCharacteristicConfigurationDescriptorAsync(
-                           GattClientCharacteristicConfigurationDescriptorValue::Notify)
-                           .get();
+            Log(4, L"шаг: подписка на уведомления");
+            auto sub_op = stat.WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::Notify);
+            if (!AwaitOp(sub_op, 5000)) {
+                Log(2, L"Подписка на уведомления не ответила за 5 с · MAC " + MacText(address));
+                ResetLink();
+                return false;
+            }
+            auto sub = sub_op.get();
             if (sub != GattCommunicationStatus::Success) {
                 Log(2, Format(L"Не удалось подписаться на уведомления (MAC %s): %s",
                               MacText(address).c_str(), CommStatusText(sub).c_str()));
@@ -1429,9 +1492,17 @@ struct Engine::Impl {
         if (!ch) return false;
         try {
             const std::string text = Utf8(line);
-            const auto result = ch.WriteValueWithResultAsync(ToBuffer(text),
-                                                             GattWriteOption::WriteWithResponse)
-                                    .get();
+            auto op = ch.WriteValueWithResultAsync(ToBuffer(text), GattWriteOption::WriteWithResponse);
+            if (!AwaitOp(op, 5000)) {
+                LogWriteError(Format(L"команда «%s» · нет ответа за 5 с", line.c_str()),
+                              GattCommunicationStatus::Unreachable);
+                try {
+                    op.Cancel();
+                } catch (...) {
+                }
+                return false;
+            }
+            const auto result = op.get();
             if (result.Status() != GattCommunicationStatus::Success) {
                 LogWriteError(Format(L"команда «%s»", line.c_str()), result.Status());
                 return false;
@@ -1503,6 +1574,18 @@ struct Engine::Impl {
         PendingBlock block = std::move(pending.front());
         pending.pop_front();
         try {
+            // Без таймаута «зависшая» запись блокировала весь поток отправки:
+            // передача стояла на 0 %.
+            if (!AwaitOp(block.op, 4000)) {
+                LogWriteError(Format(L"блок со смещением %llu · нет завершения за 4 с",
+                                     block.offset),
+                              GattCommunicationStatus::Unreachable);
+                try {
+                    block.op.Cancel();
+                } catch (...) {
+                }
+                return false;
+            }
             const auto result = block.op.get();
             if (result.Status() != GattCommunicationStatus::Success) {
                 LogWriteError(Format(L"блок со смещением %llu", block.offset), result.Status());
@@ -3028,9 +3111,23 @@ bool Engine::Connect(std::size_t index) {
     }
     bool expected = false;
     if (!d.link_busy.compare_exchange_strong(expected, true)) {
-        d.Log(1, L"Подключение уже выполняется");
-        return false;
+        // Страховка: если предыдущая попытка почему-то не завершилась совсем,
+        // не оставляем приложение в «Подключение…» до перезапуска.
+        const unsigned long long since = d.link_busy_since.load();
+        if (since && GetTickCount64() - since > 60000) {
+            d.Log(1, L"Подключение висело больше минуты — начинаю заново");
+            d.link_busy.store(false);
+            expected = false;
+            if (!d.link_busy.compare_exchange_strong(expected, true)) {
+                d.Log(1, L"Подключение уже выполняется");
+                return false;
+            }
+        } else {
+            d.Log(1, L"Подключение уже выполняется");
+            return false;
+        }
     }
+    d.link_busy_since.store(GetTickCount64());
 
     std::vector<DeviceInfo> list = d.DeviceList();
     if (index >= list.size()) {
