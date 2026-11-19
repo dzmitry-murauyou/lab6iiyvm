@@ -132,10 +132,12 @@ constexpr int kMaxPdu = 517;                     // практический м�
 // на бесконечных пересылках. Поэтому окно маленькое и адаптивное.
 constexpr unsigned long long kWindowBytesTarget = 2048;   // сколько байт держим «в полёте»
 constexpr int kWindowBlocksMin = 4;
+constexpr unsigned long long kStallMs = 1500;   // нет ACK — пробуем откатиться
+constexpr unsigned long long kWindowBytesMax = 4096;  // больше в полёте не держим
 constexpr int kWindowBlocksMax = 32;
 // Как часто приёмник подтверждает принятое.
-constexpr unsigned long long kAckBytes = 512;
-constexpr unsigned long long kAckIntervalMs = 20;
+constexpr unsigned long long kAckBytes = 192;   // подтверждаем почти каждый блок
+constexpr unsigned long long kAckIntervalMs = 10;
 constexpr int kMaxAttempts = 6;                  // попытки восстановить связь
 
 // ---------------------------------------------------------------------------
@@ -1411,14 +1413,17 @@ struct Engine::Impl {
         EncodeFrame(offset, data, size, frame);
 
         try {
-            // Write Without Response не подтверждается на уровне GATT, поэтому
-            // НЕ ждём завершения каждой записи: с ожиданием стек отправляет
-            // ровно один блок за интервал соединения (~17 мс), и скорость
-            // падает до единиц КБ/с. Поток управления — окно + ACK приёмника.
-            auto pending =
+            // Ждём результата записи: так мы точно знаем, что блок ушёл в стек,
+            // и не копим молча потерянные запросы. Скорость задаёт не это
+            // ожидание, а размер блока (MTU−7) и окно «в полёте».
+            const auto result =
                 ch.WriteValueWithResultAsync(ToBuffer(frame.data(), frame.size()),
-                                             GattWriteOption::WriteWithoutResponse);
-            (void)pending;
+                                             GattWriteOption::WriteWithoutResponse)
+                    .get();
+            if (result.Status() != GattCommunicationStatus::Success) {
+                LogWriteError(Format(L"блок со смещением %llu", offset), result.Status());
+                return false;
+            }
             WriteSucceeded();
             return true;
         } catch (hresult_error const& e) {
@@ -1518,6 +1523,7 @@ struct Engine::Impl {
         bool ok = true;
         unsigned long long last_progress_log = GetTickCount64();
         int window_blocks = 8;
+        int stall_count = 0;
         {
             int chunk_now = 0;
             {
@@ -1551,27 +1557,44 @@ struct Engine::Impl {
 
                 // Окно считаем в блоках, а не в байтах: при MTU 23 держать
                 // «в полёте» сотни записей нельзя — стек их отбросит.
-                const unsigned long long window = (unsigned long long)chunk * window_blocks;
+                const unsigned long long window =
+                    (unsigned long long)std::max(chunk, 8) * (unsigned long long)window_blocks;
 
-                if (cursor > ack_now) {
-                    // Блоки потерялись (переполнили буфер приёмника) — откат и
-                    // уменьшение окна: иначе часть данных не дойдёт никогда.
-                    cursor = ack_now;
-                    window_blocks = std::max(kWindowBlocksMin, window_blocks / 2);
-                }
+                // ВАЖНО: курсор почти всегда впереди подтверждённой позиции —
+                // это и есть окно «в полёте», а не потеря блоков. Раньше здесь
+                // стоял безусловный откат `cursor = ack_now`, и передача
+                // навсегда замирала на первом блоке (~510 Б), бесконечно
+                // переписывая его заново.
+                if (ack_now > cursor) cursor = ack_now;
+
                 if (ack_now > last_ack) {
                     // Подтверждения идут ровно — можно осторожно расширяться.
-                    if (ack_now - last_ack >= window && window_blocks < kWindowBlocksMax) {
+                    if (ack_now - last_ack >= window && window_blocks < kWindowBlocksMax &&
+                        (unsigned long long)(window_blocks + 1) * (unsigned long long)chunk <=
+                            kWindowBytesMax) {
                         ++window_blocks;
                     }
                     last_ack = ack_now;
                     last_ack_tick = GetTickCount64();
+                    stall_count = 0;
+                } else if (GetTickCount64() - last_ack_tick > kStallMs) {
+                    last_ack_tick = GetTickCount64();
+                    if (cursor > ack_now) {
+                        // В полёте были неподтверждённые блоки, а ACK нет —
+                        // значит они потерялись. Возвращаемся к подтверждённой
+                        // позиции и ужимаем окно.
+                        cursor = ack_now;
+                        window_blocks = std::max(kWindowBlocksMin, window_blocks / 2);
+                        Log(2, Format(L"Нет подтверждений — повтор с %s, окно %d блоков",
+                                      SizeText(ack_now).c_str(), window_blocks));
+                    } else if (++stall_count > 3) {
+                        throw Stall("нет подтверждений");
+                    }
                 }
 
-                if (cursor - ack_now >= window) {
+                if (cursor >= ack_now && cursor - ack_now >= window) {
                     std::unique_lock<std::mutex> lock(snd_mu);
                     snd_cv.wait_for(lock, 120ms);
-                    if (GetTickCount64() - last_ack_tick > 6000) throw Stall("нет подтверждений");
                     continue;
                 }
 
