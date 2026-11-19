@@ -141,7 +141,7 @@ void Separator(Graphics& g, const RECT& card, int y) {
 void Row(Graphics& g, const RECT& card, int y, const std::wstring& label,
          const std::wstring& value, Font* label_font, Font* value_font) {
     const int p = S(theme::InnerPad);
-    const int label_w = S(96);
+    const int label_w = S(112);
     RECT l{card.left + p, y, std::min(card.left + p + label_w, card.right - p),
            y + S(theme::RowH)};
     RECT v{l.right, y, card.right - p, y + S(theme::RowH)};
@@ -652,13 +652,17 @@ void View::DrawSessionCard(Graphics& g, const Model& model) {
     // который целится Central) и MAC подключившегося отправителя.
     std::wstring values[2];
     const wchar_t* labels[2] = {L"Связь:", L""};
+    // В рекламе Windows использует случайный адрес, поэтому MAC на стороне
+    // отправителя и MAC адаптера приёмника не совпадают — так и подписано.
     if (model.role == 1) {
-        labels[0] = L"Мой MAC:";
+        labels[0] = L"MAC адаптера:";
         values[0] = model.local_mac.empty() ? L"—" : model.local_mac;
         labels[1] = L"Отправитель:";
         values[1] = model.peer_mac.empty() ? L"не подключён" : model.peer_mac;
     } else {
         values[0] = model.device;
+        labels[1] = L"MAC адаптера:";
+        values[1] = model.local_mac.empty() ? L"—" : model.local_mac;
     }
     for (int i = 0; i < rows_ && i < 2; ++i) {
         if (labels[i][0] == L'\0') continue;

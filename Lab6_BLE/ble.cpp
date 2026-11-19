@@ -127,7 +127,15 @@ GattCharacteristicProperties Props(std::uint32_t value) {
 
 constexpr int kMaxPayloadDefault = 20 - 3 - 4;   // MTU 23 → 13 байт данных
 constexpr int kMaxPdu = 517;                     // практический максимум BLE
-constexpr unsigned long long kWindowMin = 8 * 1024;
+// Окно неподтверждённых данных. Write Without Response не повторяет записи:
+// если залить больше, чем буфер приёмника, блоки теряются и передача встаёт
+// на бесконечных пересылках. Поэтому окно маленькое и адаптивное.
+constexpr int kWindowBlocksStart = 8;                // блоков «в полёте» на старте
+constexpr int kWindowBlocksMin = 2;
+constexpr int kWindowBlocksMax = 16;
+// Как часто приёмник подтверждает принятое.
+constexpr unsigned long long kAckBytes = 512;
+constexpr unsigned long long kAckIntervalMs = 20;
 constexpr int kMaxAttempts = 6;                  // попытки восстановить связь
 
 // ---------------------------------------------------------------------------
@@ -437,6 +445,17 @@ struct Engine::Impl {
     event_token tok_subs{};
     bool receiving = false;
     bool central_here = false;
+
+    // Подтверждения отправляет отдельный поток: путь приёма блоков не должен
+    // ждать notify (иначе каждый блок обрабатывается сотни миллисекунд).
+    std::mutex ack_mu;
+    std::condition_variable ack_cv;
+    std::mutex notify_mu;   // notify из двух потоков — по очереди
+    unsigned long long ack_pending = 0;
+    bool ack_has = false;
+    std::atomic<bool> ack_stop{true};
+    std::thread ack_thread;
+    std::atomic<unsigned long long> ack_sent{0};
 
     HANDLE file = INVALID_HANDLE_VALUE;
     std::wstring r_name;
@@ -1482,6 +1501,16 @@ struct Engine::Impl {
         unsigned long long chunks = 0;
         unsigned long long last_ack_tick = GetTickCount64();
         bool ok = true;
+        int window_blocks = kWindowBlocksStart;
+        {
+            int chunk_now = 0;
+            {
+                std::lock_guard<std::mutex> lock(snd_mu);
+                chunk_now = payload;
+            }
+            Log(0, Format(L"Параметры потока: блок %d байт, окно %d блоков (%d байт)",
+                          chunk_now, window_blocks, chunk_now * window_blocks));
+        }
 
         try {
             while (cursor < size) {
@@ -1498,14 +1527,25 @@ struct Engine::Impl {
                 }
                 if (!linked) throw LinkLost("соединение закрыто");
 
-                if (cursor > ack_now) cursor = ack_now;   // откат к подтверждённому
+                // Окно считаем в блоках, а не в байтах: при MTU 23 держать
+                // «в полёте» сотни записей нельзя — стек их отбросит.
+                const unsigned long long window = (unsigned long long)chunk * window_blocks;
+
+                if (cursor > ack_now) {
+                    // Блоки потерялись (переполнили буфер приёмника) — откат и
+                    // уменьшение окна: иначе часть данных не дойдёт никогда.
+                    cursor = ack_now;
+                    window_blocks = std::max(kWindowBlocksMin, window_blocks / 2);
+                }
                 if (ack_now > last_ack) {
+                    // Подтверждения идут ровно — можно осторожно расширяться.
+                    if (ack_now - last_ack >= window && window_blocks < kWindowBlocksMax) {
+                        ++window_blocks;
+                    }
                     last_ack = ack_now;
                     last_ack_tick = GetTickCount64();
                 }
 
-                const unsigned long long window =
-                    std::max<unsigned long long>(kWindowMin, (unsigned long long)chunk * 24);
                 if (cursor - ack_now >= window) {
                     std::unique_lock<std::mutex> lock(snd_mu);
                     snd_cv.wait_for(lock, 120ms);
@@ -1691,14 +1731,25 @@ struct Engine::Impl {
                 });
                 break;
             } catch (Stall const& e) {
-                Log(2, Format(L"Приём остановился (MAC %s): %hs", MacText(address).c_str(),
-                              e.what()));
+                // Подтверждения перестали приходить: не сдаёмся, а
+                // переподключаемся и продолжаем с подтверждённой позиции —
+                // иначе большой файл обрывался бы на первом же сбое.
+                Log(2, Format(L"Приём остановился (MAC %s): %hs — повтор с подтверждённой позиции",
+                              MacText(address).c_str(), e.what()));
+                {
+                    std::lock_guard<std::mutex> lock(snd_mu);
+                    connected = false;
+                }
                 Edit([](Stats& s) {
-                    s.transfer = TrFailed;
+                    s.connected = false;
+                    s.transfer = TrPaused;
                     s.link = LinkPaused;
-                    s.status = L"Приём не отвечает";
+                    s.status = L"Приём не отвечает — восстановление…";
                 });
-                break;
+                if (attempt < kMaxAttempts) {
+                    ResetLink();
+                    SleepCancelable(1200);
+                }
             } catch (LinkLost const& e) {
                 Log(1, Format(L"Связь прервана (MAC %s): %hs", MacText(address).c_str(),
                               e.what()));
@@ -1861,16 +1912,24 @@ struct Engine::Impl {
             });
         } else {
             Log(1, L"Central отключился — сеанс сохранён для возобновления · " + CentralText());
-            Edit([](Stats& s) {
+            bool session_active = false;
+            {
+                std::lock_guard<std::mutex> lock(recv_mu);
+                session_active = r_has;
+            }
+            Edit([&](Stats& s) {
                 s.connected = false;
                 s.peer_mac.clear();
                 if (s.transfer == TrReceiving) {
                     s.transfer = TrPaused;
                     s.status = L"Связь потеряна — ждём повторного подключения";
-                } else {
+                    s.link = LinkPaused;
+                } else if (!session_active) {
+                    // Данные уже идут (сеанс открыт) — «Ожидание подключения…»
+                    // здесь было бы неправдой и путало.
                     s.status = L"Ожидание подключения…";
+                    s.link = LinkAdvertising;
                 }
-                s.link = s.transfer == TrPaused ? LinkPaused : LinkAdvertising;
             });
         }
     }
@@ -1883,11 +1942,52 @@ struct Engine::Impl {
             status = local_status;
         }
         if (!status) return;
+        // Список подписчиков бывает пуст в первые моменты после подключения,
+        // хотя notify уже доставляется: не отбрасываем отправку из-за него.
+        std::lock_guard<std::mutex> lock(notify_mu);
         try {
-            if (status.SubscribedClients().Size() == 0) return;
             status.NotifyValueAsync(ToBuffer(Utf8(line))).get();
         } catch (...) {
         }
+    }
+
+    // Просим фоновой поток отправить подтверждение (не блокируя приём блока).
+    void SignalAck(unsigned long long value) {
+        {
+            std::lock_guard<std::mutex> lock(ack_mu);
+            if (value > ack_pending) ack_pending = value;
+            ack_has = true;
+        }
+        ack_cv.notify_one();
+    }
+
+    // Поток подтверждений: отправляет ACK по сигналу и дополнительно раз в
+    // 100 мс, если принято больше, чем подтверждено (отправитель мог замолчать,
+    // упёршись в окно).
+    void AckWorker() {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        while (!ack_stop.load()) {
+            unsigned long long value = 0;
+            {
+                std::unique_lock<std::mutex> lock(ack_mu);
+                ack_cv.wait_for(lock, std::chrono::milliseconds(100),
+                                [this] { return ack_has || ack_stop.load(); });
+                if (ack_has) {
+                    value = ack_pending;
+                    ack_has = false;
+                }
+            }
+            if (ack_stop.load()) break;
+            if (value == 0) {
+                std::lock_guard<std::mutex> lock(recv_mu);
+                if (r_has && r_received > ack_sent.load()) value = r_received;
+            }
+            if (value > ack_sent.load()) {
+                ack_sent.store(value);
+                NotifyStatus(Format(L"ACK|%llu", value));
+            }
+        }
+        winrt::uninit_apartment();
     }
 
     void HandleControl(std::wstring const& line) {
@@ -1958,6 +2058,12 @@ struct Engine::Impl {
                     r_received = 0;
                     r_chunks = 0;
                     r_ack_mark = 0;
+                    ack_sent.store(0);
+                    {
+                        std::lock_guard<std::mutex> ack_lock(ack_mu);
+                        ack_pending = 0;
+                        ack_has = false;
+                    }
                     r_last_ack = 0;
                     r_last_ui = 0;
                     r_has = true;
@@ -2130,7 +2236,8 @@ struct Engine::Impl {
                     r_received += written;
                     ++r_chunks;
                     const unsigned long long now = GetTickCount64();
-                    if (r_received - r_ack_mark >= 8192 || now - r_last_ack >= 100) {
+                    if (r_received - r_ack_mark >= kAckBytes ||
+                        now - r_last_ack >= kAckIntervalMs) {
                         r_ack_mark = r_received;
                         r_last_ack = now;
                         need_ack = true;
@@ -2145,7 +2252,7 @@ struct Engine::Impl {
             }
         }
 
-        if (need_ack) NotifyStatus(Format(L"ACK|%llu", acknowledged));
+        if (need_ack) SignalAck(acknowledged);
 
         if (progress) {
             unsigned long long received = 0;
@@ -2159,6 +2266,7 @@ struct Engine::Impl {
             }
             const double speed = sample_receiver(received, false);
             Edit([&](Stats& s) {
+                s.connected = true;   // блоки идут — значит Central на связи
                 s.done = received;
                 s.total = total;
                 s.chunks = chunks;
@@ -2308,6 +2416,11 @@ struct Engine::Impl {
                       LocalMac().c_str()));
 
             Log(3, L"GATT-сервис опубликован. Идёт BLE-реклама — ожидание Central…");
+            Log(0, L"Адрес в BLE-рекламе Windows случайный — он может отличаться от MAC "
+                   L"адаптера. На отправителе выбирайте пункт «Приёмник Lab6».");
+
+            ack_stop.store(false);
+            ack_thread = std::thread([this] { AckWorker(); });
             Log(0, L"На отправителе выберите в списке «Приёмник Lab6 (" + LocalMac() +
                        L")» и нажмите «Подключить».");
             Edit([](Stats& s) {
@@ -2370,6 +2483,10 @@ struct Engine::Impl {
             if (provider_local) provider_local.StopAdvertising();
         } catch (...) {
         }
+
+        ack_stop.store(true);
+        ack_cv.notify_all();
+        JoinThread(ack_thread);
 
         {
             std::lock_guard<std::mutex> lock(recv_mu);
