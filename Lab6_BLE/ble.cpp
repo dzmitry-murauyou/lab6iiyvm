@@ -480,6 +480,14 @@ struct Engine::Impl {
     unsigned long long rx_work_us = 0;
     unsigned long long rx_work_n = 0;
     unsigned long long rx_log_ms = 0;
+    // Очередь принятых блоков: GATT-сервер отдаёт нам блок, мы копируем байты
+    // и сразу освобождаем deferral, а запись в файл идёт в отдельном потоке.
+    // Иначе стек ждёт нас и принимает один блок за интервал соединения.
+    std::deque<std::vector<std::uint8_t>> rxq;
+    std::mutex rxq_mu;
+    std::condition_variable rxq_cv;
+    std::thread rxq_thread;
+    std::atomic<bool> rxq_stop{false};
     unsigned long long r_last_ui = 0;
     bool r_has = false;
     bool r_done = false;
@@ -1988,14 +1996,50 @@ struct Engine::Impl {
 
     void OnDataWrite(GattWriteRequestedEventArgs const& args) {
         auto deferral = args.GetDeferral();
+        std::vector<std::uint8_t> bytes;
         try {
             auto request = args.GetRequestAsync().get();
-            const auto bytes = FromBuffer(request.Value());
+            bytes = FromBuffer(request.Value());
             if (request.Option() == GattWriteOption::WriteWithResponse) request.Respond();
-            HandleData(bytes);
         } catch (...) {
         }
+        // Освобождаем deferral ДО записи в файл: стек сразу может принять
+        // следующий блок, а не ждать, пока мы сходим на диск.
         deferral.Complete();
+        if (!bytes.empty()) EnqueueData(std::move(bytes));
+    }
+
+    // Поток разбора принятых блоков: только файл и подтверждения.
+    void RxQueueMain() {
+        for (;;) {
+            std::vector<std::uint8_t> bytes;
+            {
+                std::unique_lock<std::mutex> lock(rxq_mu);
+                rxq_cv.wait_for(lock, std::chrono::milliseconds(200),
+                                [this] { return rxq_stop.load() || !rxq.empty(); });
+                if (rxq.empty()) {
+                    if (rxq_stop.load()) return;
+                    continue;
+                }
+                bytes = std::move(rxq.front());
+                rxq.pop_front();
+            }
+            try {
+                HandleData(bytes);
+            } catch (...) {
+            }
+        }
+    }
+
+    void EnqueueData(std::vector<std::uint8_t> bytes) {
+        {
+            std::lock_guard<std::mutex> lock(rxq_mu);
+            // Если отправитель обогнал приём, старые блоки всё равно не нужны:
+            // он повторит их с подтверждённой позиции.
+            if (rxq.size() > 512) rxq.pop_front();
+            rxq.push_back(std::move(bytes));
+        }
+        rxq_cv.notify_one();
     }
 
     // Строка вида «Bluetooth#Bluetooth…-AA:BB:CC:DD:EE:FF» — в ней есть MAC
@@ -2638,6 +2682,8 @@ struct Engine::Impl {
 
             ack_stop.store(false);
             ack_thread = std::thread([this] { AckWorker(); });
+            rxq_stop.store(false);
+            rxq_thread = std::thread([this] { RxQueueMain(); });
             Log(0, L"На отправителе выберите в списке «Приёмник Lab6 (" + LocalMac() +
                        L")» и нажмите «Подключить».");
             Edit([](Stats& s) {
@@ -2704,6 +2750,14 @@ struct Engine::Impl {
         ack_stop.store(true);
         ack_cv.notify_all();
         JoinThread(ack_thread);
+
+        rxq_stop.store(true);
+        rxq_cv.notify_all();
+        JoinThread(rxq_thread);
+        {
+            std::lock_guard<std::mutex> lock(rxq_mu);
+            rxq.clear();
+        }
 
         {
             std::lock_guard<std::mutex> lock(recv_mu);
