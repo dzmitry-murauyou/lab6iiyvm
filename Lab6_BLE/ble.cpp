@@ -130,9 +130,9 @@ constexpr int kMaxPdu = 517;                     // практический м�
 // Окно неподтверждённых данных. Write Without Response не повторяет записи:
 // если залить больше, чем буфер приёмника, блоки теряются и передача встаёт
 // на бесконечных пересылках. Поэтому окно маленькое и адаптивное.
-constexpr int kWindowBlocksStart = 8;                // блоков «в полёте» на старте
-constexpr int kWindowBlocksMin = 2;
-constexpr int kWindowBlocksMax = 16;
+constexpr unsigned long long kWindowBytesTarget = 2048;   // сколько байт держим «в полёте»
+constexpr int kWindowBlocksMin = 4;
+constexpr int kWindowBlocksMax = 32;
 // Как часто приёмник подтверждает принятое.
 constexpr unsigned long long kAckBytes = 512;
 constexpr unsigned long long kAckIntervalMs = 20;
@@ -1154,14 +1154,29 @@ struct Engine::Impl {
                 });
 
             std::wstring name = dev.Name().c_str();
+            // Размер MTU мог измениться после обмена ATT MTU (он идёт сразу
+            // после подключения): перечитываем несколько раз и берём максимум.
             int pdu = 23;
-            try {
-                if (sess) pdu = (int)sess.MaxPduSize();
-            } catch (...) {
-                pdu = 23;
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                int fresh = 0;
+                try {
+                    if (sess) fresh = (int)sess.MaxPduSize();
+                } catch (...) {
+                    fresh = 0;
+                }
+                if (fresh > pdu) pdu = fresh;
+                if (pdu >= kMaxPdu) break;
+                if (attempt < 3) SleepCancelable(120);
             }
             pdu = std::clamp(pdu, 23, kMaxPdu);
             const int chunk = std::max(8, pdu - 3 - 4);
+            if (pdu <= 23) {
+                Log(1, Format(L"MTU не увеличен (%d): блок %d байт — приёмник не согласовал "
+                              L"больший MTU, скорость будет низкой",
+                              pdu, chunk));
+            }
+            Log(0, Format(L"MTU %d → блок данных %d байт, окно %d байт", pdu, chunk,
+                          (int)kWindowBytesTarget));
 
             {
                 std::lock_guard<std::mutex> lock(snd_mu);
@@ -1396,14 +1411,14 @@ struct Engine::Impl {
         EncodeFrame(offset, data, size, frame);
 
         try {
-            const auto result =
+            // Write Without Response не подтверждается на уровне GATT, поэтому
+            // НЕ ждём завершения каждой записи: с ожиданием стек отправляет
+            // ровно один блок за интервал соединения (~17 мс), и скорость
+            // падает до единиц КБ/с. Поток управления — окно + ACK приёмника.
+            auto pending =
                 ch.WriteValueWithResultAsync(ToBuffer(frame.data(), frame.size()),
-                                             GattWriteOption::WriteWithoutResponse)
-                    .get();
-            if (result.Status() != GattCommunicationStatus::Success) {
-                LogWriteError(Format(L"блок со смещением %llu", offset), result.Status());
-                return false;
-            }
+                                             GattWriteOption::WriteWithoutResponse);
+            (void)pending;
             WriteSucceeded();
             return true;
         } catch (hresult_error const& e) {
@@ -1501,13 +1516,20 @@ struct Engine::Impl {
         unsigned long long chunks = 0;
         unsigned long long last_ack_tick = GetTickCount64();
         bool ok = true;
-        int window_blocks = kWindowBlocksStart;
+        unsigned long long last_progress_log = GetTickCount64();
+        int window_blocks = 8;
         {
             int chunk_now = 0;
             {
                 std::lock_guard<std::mutex> lock(snd_mu);
                 chunk_now = payload;
             }
+            const int safe_chunk = std::max(8, chunk_now);
+            // Держим «в полёте» примерно kWindowBytesTarget байт: при малом
+            // MTU это много мелких блоков, при большом — несколько крупных.
+            window_blocks = (int)std::clamp<unsigned long long>(
+                kWindowBytesTarget / (unsigned long long)safe_chunk,
+                (unsigned long long)kWindowBlocksMin, (unsigned long long)kWindowBlocksMax);
             Log(0, Format(L"Параметры потока: блок %d байт, окно %d блоков (%d байт)",
                           chunk_now, window_blocks, chunk_now * window_blocks));
         }
@@ -1577,6 +1599,15 @@ struct Engine::Impl {
                     last_ui = now;
                     const double speed = SampleSpeed(ack_now, false);
                     PublishProgress(ack_now, size, speed, chunks);
+                    // Раз в 2 с — строка прогресса в журнал: по ней видно,
+                    // идёт ли передача и с какой реальной скоростью.
+                    if (now - last_progress_log >= 2000) {
+                        last_progress_log = now;
+                        Log(0, Format(L"Прогресс: %s из %s, %s/с, окно %d блоков",
+                                      SizeText(ack_now).c_str(), SizeText(size).c_str(),
+                                      SizeText((unsigned long long)(speed > 0 ? speed : 0)).c_str(),
+                                      window_blocks));
+                    }
                 }
             }
         } catch (...) {
@@ -1860,6 +1891,23 @@ struct Engine::Impl {
         return L"идентификатор Central недоступен";
     }
 
+    // Согласованный с Central размер MTU (0 — неизвестен).
+    int CentralMtu() {
+        try {
+            GattLocalCharacteristic status = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(recv_mu);
+                status = local_status;
+            }
+            if (status) {
+                auto clients = status.SubscribedClients();
+                if (clients.Size() > 0) return (int)clients.GetAt(0).Session().MaxPduSize();
+            }
+        } catch (...) {
+        }
+        return 0;
+    }
+
     // Короткий MAC Central (из строки идентификатора) — для строки в окне.
     std::wstring CentralMac() {
         const std::uint64_t mac = MacFromDeviceId(CentralText());
@@ -1902,7 +1950,13 @@ struct Engine::Impl {
         if (!changed) return;
 
         if (has_client) {
-            Log(3, L"Central подключился к GATT-серверу · " + CentralText());
+            {
+                const int mtu_now = CentralMtu();
+                Log(3, L"Central подключился к GATT-серверу · " + CentralText() +
+                           (mtu_now > 0 ? Format(L" · MTU %d, блок %d байт", mtu_now,
+                                                 std::max(8, mtu_now - 7))
+                                        : std::wstring()));
+            }
             const std::wstring central_mac = CentralMac();
             Edit([&](Stats& s) {
                 s.peer_mac = central_mac;
