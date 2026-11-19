@@ -130,10 +130,10 @@ constexpr int kMaxPdu = 517;                     // практический м�
 // Окно неподтверждённых данных. Write Without Response не повторяет записи:
 // если залить больше, чем буфер приёмника, блоки теряются и передача встаёт
 // на бесконечных пересылках. Поэтому окно маленькое и адаптивное.
-constexpr unsigned long long kWindowBytesTarget = 2048;   // сколько байт держим «в полёте»
+constexpr unsigned long long kWindowBytesTarget = 4096;   // сколько байт держим «в полёте»
 constexpr int kWindowBlocksMin = 4;
 constexpr unsigned long long kStallMs = 1500;   // нет ACK — пробуем откатиться
-constexpr unsigned long long kWindowBytesMax = 4096;  // больше в полёте не держим
+constexpr unsigned long long kWindowBytesMax = 8192;  // больше в полёте не держим
 constexpr int kWindowBlocksMax = 32;
 // Как часто приёмник подтверждает принятое.
 constexpr unsigned long long kAckBytes = 192;   // подтверждаем почти каждый блок
@@ -452,7 +452,6 @@ struct Engine::Impl {
     // ждать notify (иначе каждый блок обрабатывается сотни миллисекунд).
     std::mutex ack_mu;
     std::condition_variable ack_cv;
-    std::mutex notify_mu;   // notify из двух потоков — по очереди
     unsigned long long ack_pending = 0;
     bool ack_has = false;
     std::atomic<bool> ack_stop{true};
@@ -1400,7 +1399,17 @@ struct Engine::Impl {
         }
     }
 
-    bool WriteBlock(unsigned long long offset, const std::uint8_t* data, std::size_t size) {
+    // Одна незавершённая запись блока: сама операция и её смещение (для журнала).
+    struct PendingBlock {
+        winrt::Windows::Foundation::IAsyncOperation<GattWriteResult> op{};
+        unsigned long long offset = 0;
+    };
+
+    // Ставит блок в очередь записи, НЕ дожидаясь её завершения. Так в стеке
+    // может быть несколько записей сразу, и за интервал соединения уходит
+    // несколько блоков, а не один.
+    bool StartWriteBlock(unsigned long long offset, const std::uint8_t* data, std::size_t size,
+                         std::deque<PendingBlock>& pending) {
         GattCharacteristic ch = nullptr;
         {
             std::lock_guard<std::mutex> lock(snd_mu);
@@ -1412,22 +1421,48 @@ struct Engine::Impl {
         std::vector<std::uint8_t> frame;
         EncodeFrame(offset, data, size, frame);
 
+        // Стек может не принять вторую запись, пока жива первая (у некоторых
+        // версий Windows на характеристику разрешена одна операция). Тогда
+        // дожидаемся старой и пробуем ещё раз, а не рвём сеанс.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            try {
+                PendingBlock block;
+                block.op = ch.WriteValueWithResultAsync(ToBuffer(frame.data(), frame.size()),
+                                                        GattWriteOption::WriteWithoutResponse);
+                block.offset = offset;
+                pending.push_back(std::move(block));
+                return true;
+            } catch (hresult_error const& e) {
+                const bool drained = !pending.empty() && FinishOldestWrite(pending);
+                if (attempt > 0 || !drained) {
+                    LogWriteError(Format(L"блок со смещением %llu · исключение: %s", offset,
+                                         e.message().c_str()),
+                                  GattCommunicationStatus::Unreachable);
+                    return false;
+                }
+            } catch (...) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // Дожидается самой старой записи и проверяет её результат: блоки не
+    // теряются молча, а ошибка сразу видна в журнале.
+    bool FinishOldestWrite(std::deque<PendingBlock>& pending) {
+        if (pending.empty()) return true;
+        PendingBlock block = std::move(pending.front());
+        pending.pop_front();
         try {
-            // Ждём результата записи: так мы точно знаем, что блок ушёл в стек,
-            // и не копим молча потерянные запросы. Скорость задаёт не это
-            // ожидание, а размер блока (MTU−7) и окно «в полёте».
-            const auto result =
-                ch.WriteValueWithResultAsync(ToBuffer(frame.data(), frame.size()),
-                                             GattWriteOption::WriteWithoutResponse)
-                    .get();
+            const auto result = block.op.get();
             if (result.Status() != GattCommunicationStatus::Success) {
-                LogWriteError(Format(L"блок со смещением %llu", offset), result.Status());
+                LogWriteError(Format(L"блок со смещением %llu", block.offset), result.Status());
                 return false;
             }
             WriteSucceeded();
             return true;
         } catch (hresult_error const& e) {
-            LogWriteError(Format(L"блок со смещением %llu · исключение: %s", offset,
+            LogWriteError(Format(L"блок со смещением %llu · исключение: %s", block.offset,
                                  e.message().c_str()),
                           GattCommunicationStatus::Unreachable);
             return false;
@@ -1524,6 +1559,7 @@ struct Engine::Impl {
         unsigned long long last_progress_log = GetTickCount64();
         int window_blocks = 8;
         int stall_count = 0;
+        std::deque<PendingBlock> pending;   // записи «в полёте»
         {
             int chunk_now = 0;
             {
@@ -1611,7 +1647,14 @@ struct Engine::Impl {
                     throw std::runtime_error("чтение файла");
                 }
 
-                if (!WriteBlock(cursor, buffer.data(), got)) {
+                // Держим в полёте до window_blocks записей и ждём только
+                // когда очередь полна: иначе стек отправляет один блок за
+                // интервал соединения (это и давало единицы КБ/с).
+                const std::size_t in_flight = (std::size_t)std::max(2, std::min(window_blocks, 16));
+                while (pending.size() >= in_flight) {
+                    if (!FinishOldestWrite(pending)) throw LinkLost("блок не записан");
+                }
+                if (!StartWriteBlock(cursor, buffer.data(), got, pending)) {
                     throw LinkLost("блок не записан");
                 }
                 cursor += got;
@@ -1638,6 +1681,12 @@ struct Engine::Impl {
             throw;
         }
         CloseHandle(file);
+
+        // Дожидаемся записей, ещё находящихся в стеке: иначе последние блоки
+        // могли не уйти, а мы бы уже просили SYNC.
+        while (!pending.empty()) {
+            if (!FinishOldestWrite(pending)) throw LinkLost("последние блоки не записаны");
+        }
 
         // Ждём подтверждения последних блоков. Приёмник подтверждает раз в
         // 8 КБ/100 мс, поэтому для маленького файла последний ACK мог ещё не
@@ -2021,9 +2070,11 @@ struct Engine::Impl {
         if (!status) return;
         // Список подписчиков бывает пуст в первые моменты после подключения,
         // хотя notify уже доставляется: не отбрасываем отправку из-за него.
-        std::lock_guard<std::mutex> lock(notify_mu);
+        // Само ожидание (.get()) тут не нужно: каждый notify занимает PDU и
+        // десятки миллисекунд, а подтверждения идемпотентны — следующее ACK
+        // всё равно несёт более свежее смещение.
         try {
-            status.NotifyValueAsync(ToBuffer(Utf8(line))).get();
+            status.NotifyValueAsync(ToBuffer(Utf8(line)));
         } catch (...) {
         }
     }
