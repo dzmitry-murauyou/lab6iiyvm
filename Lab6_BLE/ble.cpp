@@ -166,6 +166,12 @@ std::wstring MacText(std::uint64_t address) {
     return buffer;
 }
 
+// «Имя (AA:BB:CC:DD:EE:FF)» для журнала; если имени нет — только MAC.
+std::wstring MacWithName(std::uint64_t address, std::wstring const& name) {
+    return name.empty() ? MacText(address)
+                        : Format(L"%s (%s)", name.c_str(), MacText(address).c_str());
+}
+
 std::wstring SizeText(unsigned long long bytes) {
     const wchar_t* units[] = {L"Б", L"КБ", L"МБ", L"ГБ"};
     double value = (double)bytes;
@@ -357,6 +363,9 @@ struct Engine::Impl {
     event_token value_token{};
     bool value_subscribed = false;
     bool connected = false;
+    std::uint64_t link_address = 0;   // MAC текущего соединения — для журнала
+    bool write_failing = false;       // ошибка записи уже в журнале
+    bool status_seen = false;         // первое уведомление Status уже отмечено
 
     // Определение имён: у большинства BLE-устройств имени нет в рекламном
     // пакете, оно лежит в GAP-характеристике 0x2A00 (её читают «Параметры
@@ -621,6 +630,11 @@ struct Engine::Impl {
             return false;
         }
 
+        try {
+            Log(0, Format(L"Адаптер MAC: %s", MacText(adapter.BluetoothAddress()).c_str()));
+        } catch (...) {
+        }
+
         const bool le = adapter.IsLowEnergySupported();
         const bool central = adapter.IsCentralRoleSupported();
         const bool peripheral = adapter.IsPeripheralRoleSupported();
@@ -763,12 +777,13 @@ struct Engine::Impl {
 
         if (added) {
             Log(marked ? 3 : 0,
-                Format(L"Найдено: %s (%s), RSSI %d дБм%s",
-                       name.empty() ? L"без имени" : name.c_str(), MacText(address).c_str(), rssi,
+                Format(L"Найдено: MAC %s, имя «%s», адрес %s, RSSI %d дБм%s",
+                       MacText(address).c_str(), name.empty() ? L"нет" : name.c_str(),
+                       address_type == 1 ? L"random" : L"public", rssi,
                        marked ? L" — наш сервис" : L""));
             NotifyUi();
         } else if (marked) {
-            Log(3, Format(L"Устройство %s рекламирует наш сервис", MacText(address).c_str()));
+            Log(3, Format(L"Устройство MAC %s рекламирует наш сервис", MacText(address).c_str()));
             NotifyUi();
         }
     }
@@ -776,7 +791,7 @@ struct Engine::Impl {
     // =======================================================================
     //  ПОДКЛЮЧЕНИЕ (Central)
     // =======================================================================
-    void OnDeviceConnectionChanged(BluetoothConnectionStatus status) {
+    void OnDeviceConnectionChanged(BluetoothConnectionStatus status, std::uint64_t address) {
         if (status != BluetoothConnectionStatus::Disconnected) return;
         bool was = false;
         {
@@ -786,7 +801,7 @@ struct Engine::Impl {
         }
         snd_cv.notify_all();
         if (!was) return;
-        Log(1, L"Соединение разорвано");
+        Log(1, L"Соединение разорвано: MAC " + MacText(address));
         Edit([](Stats& s) {
             s.connected = false;
             if (s.transfer == TrSending) {
@@ -801,6 +816,22 @@ struct Engine::Impl {
     }
 
     void OnValueChanged(GattValueChangedEventArgs const& args) {
+        // Первое уведомление отмечаем один раз: если ACK не идут, эта строка
+        // в журнале покажет, что подписка работает, а проблема не в ней.
+        bool first_status = false;
+        std::uint64_t address = 0;
+        {
+            std::lock_guard<std::mutex> lock(snd_mu);
+            if (!status_seen) {
+                status_seen = true;
+                first_status = true;
+                address = link_address;
+            }
+        }
+        if (first_status) {
+            Log(0, L"Первое уведомление Status получено (MAC " + MacText(address) + L")");
+        }
+
         std::vector<std::uint8_t> bytes;
         try {
             bytes = FromBuffer(args.CharacteristicValue());
@@ -870,7 +901,14 @@ struct Engine::Impl {
         ResetLink();
 
         SetLink(LinkConnecting, L"Подключение…");
-        Log(0, L"Подключение к " + MacText(address) + L"…");
+        Log(0, Format(L"Подключение к MAC %s (%s)…", MacText(address).c_str(),
+                      address_type == 1 ? L"random" : L"public"));
+        {
+            std::lock_guard<std::mutex> lock(snd_mu);
+            link_address = address;
+            write_failing = false;
+            status_seen = false;
+        }
 
         try {
             // Тип адреса важен: смартфоны и трекеры рекламируются со случайным
@@ -879,7 +917,8 @@ struct Engine::Impl {
                 address_type == 1 ? BluetoothAddressType::Random : BluetoothAddressType::Public;
             BluetoothLEDevice dev = BluetoothLEDevice::FromBluetoothAddressAsync(address, type).get();
             if (!dev) {
-                Log(2, L"Устройство не найдено (возможно, выключено)");
+                Log(2, L"Устройство MAC " + MacText(address) +
+                           L" не найдено (возможно, выключено)");
                 return false;
             }
 
@@ -888,7 +927,8 @@ struct Engine::Impl {
                 sess = GattSession::FromDeviceIdAsync(dev.BluetoothDeviceId()).get();
                 if (sess) sess.MaintainConnection(true);
             } catch (...) {
-                Log(1, L"Не удалось удержать соединение (GattSession)");
+                Log(1, L"Не удалось удержать соединение (GattSession), MAC " +
+                           MacText(address));
             }
 
             GattDeviceService svc = nullptr;
@@ -903,14 +943,16 @@ struct Engine::Impl {
                 }
             }
             if (!svc) {
-                Log(2, L"Сервис передачи не найден. Устройство должно быть в роли «Приёмник».");
+                Log(2, L"Сервис передачи не найден на MAC " + MacText(address) +
+                           L". Устройство должно быть в роли «Приёмник».");
                 ResetLink();
                 return false;
             }
 
             auto chars = svc.GetCharacteristicsAsync(BluetoothCacheMode::Uncached).get();
             if (chars.Status() != GattCommunicationStatus::Success) {
-                Log(2, L"Не удалось получить характеристики: " + CommStatusText(chars.Status()));
+                Log(2, Format(L"Не удалось получить характеристики на MAC %s: %s",
+                              MacText(address).c_str(), CommStatusText(chars.Status()).c_str()));
                 ResetLink();
                 return false;
             }
@@ -926,7 +968,8 @@ struct Engine::Impl {
                 }
             }
             if (!ctrl || !data || !stat) {
-                Log(2, L"В сервисе нет нужных характеристик Control/Data/Status");
+                Log(2, L"На MAC " + MacText(address) +
+                           L" в сервисе нет нужных характеристик Control/Data/Status");
                 ResetLink();
                 return false;
             }
@@ -935,10 +978,13 @@ struct Engine::Impl {
                            GattClientCharacteristicConfigurationDescriptorValue::Notify)
                            .get();
             if (sub != GattCommunicationStatus::Success) {
-                Log(2, L"Не удалось подписаться на уведомления: " + CommStatusText(sub));
+                Log(2, Format(L"Не удалось подписаться на уведомления (MAC %s): %s",
+                              MacText(address).c_str(), CommStatusText(sub).c_str()));
                 ResetLink();
                 return false;
             }
+
+            Log(0, Format(L"Уведомления Status включены (MAC %s)", MacText(address).c_str()));
 
             const event_token token = stat.ValueChanged(
                 [this](GattCharacteristic const&, GattValueChangedEventArgs const& args) {
@@ -978,8 +1024,9 @@ struct Engine::Impl {
             }
 
             device_token = dev.ConnectionStatusChanged(
-                [this](BluetoothLEDevice const& d, winrt::Windows::Foundation::IInspectable const&) {
-                    OnDeviceConnectionChanged(d.ConnectionStatus());
+                [this, address](BluetoothLEDevice const& d,
+                                winrt::Windows::Foundation::IInspectable const&) {
+                    OnDeviceConnectionChanged(d.ConnectionStatus(), address);
                 });
 
             int known_rssi = -127;
@@ -1006,11 +1053,12 @@ struct Engine::Impl {
                           chunk));
             return true;
         } catch (hresult_error const& e) {
-            Log(2, L"Ошибка подключения: " + std::wstring(e.message().c_str()));
+            Log(2, Format(L"Ошибка подключения к MAC %s: %s", MacText(address).c_str(),
+                          e.message().c_str()));
             ResetLink();
             return false;
         } catch (...) {
-            Log(2, L"Ошибка подключения");
+            Log(2, L"Ошибка подключения к MAC " + MacText(address));
             ResetLink();
             return false;
         }
@@ -1087,6 +1135,32 @@ struct Engine::Impl {
     // =======================================================================
     //  ПЕРЕДАЧА (Central → Peripheral)
     // =======================================================================
+    // Один и тот же сбой записи пишем в журнал один раз (иначе поток блоков
+    // засыпает журнал сотнями строк и MAC в них не найти).
+    void LogWriteError(std::wstring const& what, GattCommunicationStatus status) {
+        std::uint64_t address = 0;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lock(snd_mu);
+            first = !write_failing;
+            write_failing = true;
+            address = link_address;
+        }
+        if (!first) return;
+        Log(2, Format(L"Запись не выполнена: %s · MAC %s · %s", what.c_str(),
+                      MacText(address).c_str(), CommStatusText(status).c_str()));
+    }
+
+    void WriteSucceeded() {
+        std::lock_guard<std::mutex> lock(snd_mu);
+        write_failing = false;
+    }
+
+    std::uint64_t LinkAddress() {
+        std::lock_guard<std::mutex> lock(snd_mu);
+        return link_address;
+    }
+
     bool WriteControl(std::wstring const& line) {
         GattCharacteristic ch = nullptr;
         {
@@ -1097,10 +1171,20 @@ struct Engine::Impl {
         if (!ch) return false;
         try {
             const std::string text = Utf8(line);
-            auto result = ch.WriteValueWithResultAsync(ToBuffer(text),
-                                                       GattWriteOption::WriteWithResponse)
-                              .get();
-            return result.Status() == GattCommunicationStatus::Success;
+            const auto result = ch.WriteValueWithResultAsync(ToBuffer(text),
+                                                             GattWriteOption::WriteWithResponse)
+                                    .get();
+            if (result.Status() != GattCommunicationStatus::Success) {
+                LogWriteError(Format(L"команда «%s»", line.c_str()), result.Status());
+                return false;
+            }
+            WriteSucceeded();
+            return true;
+        } catch (hresult_error const& e) {
+            LogWriteError(Format(L"команда «%s» · исключение: %s", line.c_str(),
+                                 e.message().c_str()),
+                          GattCommunicationStatus::Unreachable);
+            return false;
         } catch (...) {
             return false;
         }
@@ -1119,10 +1203,21 @@ struct Engine::Impl {
         EncodeFrame(offset, data, size, frame);
 
         try {
-            auto result = ch.WriteValueWithResultAsync(ToBuffer(frame.data(), frame.size()),
-                                                       GattWriteOption::WriteWithoutResponse)
-                              .get();
-            return result.Status() == GattCommunicationStatus::Success;
+            const auto result =
+                ch.WriteValueWithResultAsync(ToBuffer(frame.data(), frame.size()),
+                                             GattWriteOption::WriteWithoutResponse)
+                    .get();
+            if (result.Status() != GattCommunicationStatus::Success) {
+                LogWriteError(Format(L"блок со смещением %llu", offset), result.Status());
+                return false;
+            }
+            WriteSucceeded();
+            return true;
+        } catch (hresult_error const& e) {
+            LogWriteError(Format(L"блок со смещением %llu · исключение: %s", offset,
+                                 e.message().c_str()),
+                          GattCommunicationStatus::Unreachable);
+            return false;
         } catch (...) {
             return false;
         }
@@ -1197,7 +1292,10 @@ struct Engine::Impl {
             s.transfer = TrSending;
             s.status = offset ? L"Возобновление передачи…" : L"Передача файла…";
         });
-        if (offset > 0) Log(3, L"Приёмник принял ранее " + SizeText(offset) + L" — продолжаем");
+        if (offset > 0) {
+            Log(3, L"Приёмник (MAC " + MacText(LinkAddress()) + L") принял ранее " +
+                       SizeText(offset) + L" — продолжаем");
+        }
 
         HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -1323,10 +1421,11 @@ struct Engine::Impl {
 
         if (ok) {
             const std::wstring extra = saved.empty() ? std::wstring() : (L", файл: " + saved);
-            Log(3, Format(L"Готово: %s, CRC32 %08X совпал%s", SizeText(size).c_str(), remote_crc,
-                          extra.c_str()));
+            Log(3, Format(L"Готово: %s, CRC32 %08X совпал%s · MAC %s", SizeText(size).c_str(),
+                          remote_crc, extra.c_str(), MacText(LinkAddress()).c_str()));
         } else {
-            Log(2, Format(L"CRC32 не совпал: отправитель %08X, приёмник %08X", crc, remote_crc));
+            Log(2, Format(L"CRC32 не совпал (MAC %s): отправитель %08X, приёмник %08X",
+                          MacText(LinkAddress()).c_str(), crc, remote_crc));
         }
         return ok;
     }
@@ -1382,7 +1481,8 @@ struct Engine::Impl {
             s.transfer = TrSending;
             s.status = L"Подготовка…";
         });
-        Log(0, Format(L"Файл «%s»: %s, CRC32 %08X", name.c_str(), SizeText(size).c_str(), crc));
+        Log(0, Format(L"Файл «%s»: %s, CRC32 %08X → MAC %s", name.c_str(),
+                      SizeText(size).c_str(), crc, MacText(address).c_str()));
 
         bool finished = false;
         bool link_failed = false;
@@ -1417,7 +1517,8 @@ struct Engine::Impl {
                 });
                 break;
             } catch (Stall const& e) {
-                Log(2, Format(L"Приём остановился: %hs", e.what()));
+                Log(2, Format(L"Приём остановился (MAC %s): %hs", MacText(address).c_str(),
+                              e.what()));
                 Edit([](Stats& s) {
                     s.transfer = TrFailed;
                     s.link = LinkPaused;
@@ -1425,7 +1526,8 @@ struct Engine::Impl {
                 });
                 break;
             } catch (LinkLost const& e) {
-                Log(1, Format(L"Связь прервана: %hs", e.what()));
+                Log(1, Format(L"Связь прервана (MAC %s): %hs", MacText(address).c_str(),
+                              e.what()));
                 {
                     std::lock_guard<std::mutex> lock(snd_mu);
                     connected = false;
@@ -1437,8 +1539,8 @@ struct Engine::Impl {
                     s.status = L"Связь потеряна — восстановление…";
                 });
                 if (attempt < kMaxAttempts) {
-                    Log(0, Format(L"Попытка восстановить соединение (%d из %d)…", attempt + 1,
-                                  kMaxAttempts));
+                    Log(0, Format(L"Попытка восстановить соединение с MAC %s (%d из %d)…",
+                                  MacText(address).c_str(), attempt + 1, kMaxAttempts));
                     ResetLink();
                     SleepCancelable(2000);
                 }
@@ -1463,7 +1565,9 @@ struct Engine::Impl {
                 s.speed = 0.0;
                 s.eta = 0.0;
             });
-            if (link_failed) Log(2, L"Не удалось установить соединение с приёмником");
+            if (link_failed) {
+                Log(2, L"Не удалось установить соединение с приёмником MAC " + MacText(address));
+            }
         }
 
         send_busy.store(false);
@@ -1510,6 +1614,27 @@ struct Engine::Impl {
         deferral.Complete();
     }
 
+    // Строка вида «Bluetooth#Bluetooth…-AA:BB:CC:DD:EE:FF» — в ней есть MAC
+    // и адаптера, и Central: по ней видно, кто именно подключился.
+    std::wstring CentralText() {
+        try {
+            GattLocalCharacteristic status = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(recv_mu);
+                status = local_status;
+            }
+            if (status) {
+                auto clients = status.SubscribedClients();
+                if (clients.Size() > 0) {
+                    const std::wstring id = clients.GetAt(0).Session().DeviceId().Id().c_str();
+                    if (!id.empty()) return id;
+                }
+            }
+        } catch (...) {
+        }
+        return L"идентификатор Central недоступен";
+    }
+
     void OnStatusRead(GattReadRequestedEventArgs const& args) {
         auto deferral = args.GetDeferral();
         try {
@@ -1546,14 +1671,14 @@ struct Engine::Impl {
         if (!changed) return;
 
         if (has_client) {
-            Log(3, L"Central подключился к GATT-серверу");
+            Log(3, L"Central подключился к GATT-серверу · " + CentralText());
             Edit([](Stats& s) {
                 s.connected = true;
                 s.link = s.transfer == TrReceiving ? LinkTransfer : LinkReady;
                 s.status = L"Central подключён";
             });
         } else {
-            Log(1, L"Central отключился — сеанс сохранён для возобновления");
+            Log(1, L"Central отключился — сеанс сохранён для возобновления · " + CentralText());
             Edit([](Stats& s) {
                 s.connected = false;
                 if (s.transfer == TrReceiving) {
@@ -1688,11 +1813,12 @@ struct Engine::Impl {
         sample_receiver(offset, true);
 
         if (resumed) {
-            Log(3, Format(L"Приём «%s»: продолжаем с %s из %s", name.c_str(),
-                          SizeText(offset).c_str(), SizeText(size).c_str()));
+            Log(3, Format(L"Приём «%s» от Central %s: продолжаем с %s из %s", name.c_str(),
+                          CentralText().c_str(), SizeText(offset).c_str(),
+                          SizeText(size).c_str()));
         } else {
-            Log(0, Format(L"Приём «%s»: %s, ожидаемый CRC32 %08X", name.c_str(),
-                          SizeText(size).c_str(), crc));
+            Log(0, Format(L"Приём «%s» от Central %s: %s, ожидаемый CRC32 %08X", name.c_str(),
+                          CentralText().c_str(), SizeText(size).c_str(), crc));
         }
         NotifyStatus(Format(L"READY|%llu", offset));
     }
@@ -1752,8 +1878,9 @@ struct Engine::Impl {
         });
 
         if (ok) {
-            Log(3, Format(L"Принято %s, CRC32 %08X совпал, файл: %s", SizeText(file_size).c_str(),
-                          actual, path.c_str()));
+            Log(3, Format(L"Принято %s, CRC32 %08X совпал, файл: %s · Central %s",
+                          SizeText(file_size).c_str(), actual, path.c_str(),
+                          CentralText().c_str()));
         } else {
             Log(2, Format(L"CRC32 не совпал: ожидали %08X, получили %08X (получено %s из %s)",
                           expected, actual, SizeText(file_size).c_str(),
@@ -1785,7 +1912,8 @@ struct Engine::Impl {
             r_done = false;
         }
         NotifyStatus(L"ABORTED");
-        Log(1, L"Передача отменена отправителем (частичный файл сохранён)");
+        Log(1, L"Передача отменена отправителем (частичный файл сохранён) · Central " +
+                   CentralText());
         Edit([](Stats& s) {
             s.transfer = TrPaused;
             s.status = L"Передача отменена отправителем";
@@ -2258,6 +2386,7 @@ bool Engine::Connect(std::size_t index) {
 
     const std::uint64_t address = list[index].address;
     const int address_type = list[index].address_type;
+    d.Log(0, L"Выбрано устройство: " + MacWithName(address, list[index].name));
     d.link_thread = std::thread([&d, address, address_type] {
         try {
             d.ConnectJob(address, address_type);
@@ -2275,6 +2404,7 @@ void Engine::Disconnect() {
         return;
     }
     JoinThread(d.link_thread);
+    const std::uint64_t was_address = d.LinkAddress();
     {
         std::thread worker([&d] {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -2291,7 +2421,8 @@ void Engine::Disconnect() {
         s.mtu = 0;
         s.payload = 0;
     });
-    d.Log(0, L"Отключено");
+    d.Log(0, was_address ? (L"Отключено от MAC " + MacText(was_address))
+                         : std::wstring(L"Отключено"));
 }
 
 bool Engine::StartSend(const std::wstring& path) {
