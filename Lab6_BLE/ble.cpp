@@ -56,6 +56,7 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -357,6 +358,14 @@ struct Engine::Impl {
     bool value_subscribed = false;
     bool connected = false;
 
+    // Определение имён: у большинства BLE-устройств имени нет в рекламном
+    // пакете, оно лежит в GAP-характеристике 0x2A00 (её читают «Параметры
+    // Windows»). Читаем в отдельном потоке, чтобы не тормозить скан.
+    std::atomic<bool> name_stop{false};
+    std::mutex name_mu;
+    std::deque<std::pair<std::uint64_t, int>> name_queue;
+    std::set<std::uint64_t> name_tried;
+
     std::uint64_t target = 0;
     int target_type = 0;
     std::wstring target_name;
@@ -454,26 +463,108 @@ struct Engine::Impl {
     // =======================================================================
     //  СКАНИРОВАНИЕ (Central)
     // =======================================================================
-    // Имя устройства из системного кэша: у большинства BLE-устройств его нет
-    // в рекламном пакете (оно приходит только в scan response или читается из
-    // GAP-сервиса). Windows знает имена уже виденных устройств — забираем имя
-    // по запросу, в фоне, чтобы не тормозить сканирование.
-    void ResolveName(std::uint64_t address, int address_type) {
-        std::thread([this, address, address_type] {
-            winrt::init_apartment(winrt::apartment_type::multi_threaded);
-            try {
-                const BluetoothAddressType type = address_type == 1 ? BluetoothAddressType::Random
-                                                                   : BluetoothAddressType::Public;
-                BluetoothLEDevice dev = BluetoothLEDevice::FromBluetoothAddressAsync(address, type).get();
-                if (dev) {
-                    const std::wstring name = dev.Name().c_str();
-                    dev.Close();
-                    if (!name.empty()) SetDeviceName(address, name);
+    // Имя устройства: сначала системный кэш, затем GAP-характеристика 0x2A00.
+    // Второй шаг требует подключения, поэтому выполняется только в фоновом
+    // потоке и не для всех устройств сразу.
+    std::wstring QueryName(std::uint64_t address, int address_type) {
+        BluetoothLEDevice dev = nullptr;
+        std::wstring name;
+        try {
+            const BluetoothAddressType type =
+                address_type == 1 ? BluetoothAddressType::Random : BluetoothAddressType::Public;
+            dev = BluetoothLEDevice::FromBluetoothAddressAsync(address, type).get();
+            if (!dev) return std::wstring();
+
+            name = dev.Name().c_str();
+            if (!name.empty()) {
+                dev.Close();
+                return name;
+            }
+
+            auto gap = dev.GetGattServicesForUuidAsync(GattServiceUuids::GenericAccess(),
+                                                       BluetoothCacheMode::Uncached)
+                           .get();
+            if (gap.Status() == GattCommunicationStatus::Success && gap.Services().Size() > 0) {
+                auto chars = gap.Services()
+                                 .GetAt(0)
+                                 .GetCharacteristicsForUuidAsync(GattCharacteristicUuids::GapDeviceName(),
+                                                                 BluetoothCacheMode::Uncached)
+                                 .get();
+                if (chars.Status() == GattCommunicationStatus::Success &&
+                    chars.Characteristics().Size() > 0) {
+                    auto res = chars.Characteristics()
+                                   .GetAt(0)
+                                   .ReadValueAsync(BluetoothCacheMode::Uncached)
+                                   .get();
+                    if (res.Status() == GattCommunicationStatus::Success && res.Value()) {
+                        DataReader reader = DataReader::FromBuffer(res.Value());
+                        std::vector<std::uint8_t> bytes(reader.UnconsumedBufferLength());
+                        if (!bytes.empty()) reader.ReadBytes(bytes);
+                        name = Wide(std::string(bytes.begin(), bytes.end()));
+                    }
                 }
+            }
+            dev.Close();
+        } catch (...) {
+            try {
+                if (dev) dev.Close();
             } catch (...) {
             }
-            winrt::uninit_apartment();
-        }).detach();
+            return std::wstring();
+        }
+        return name;
+    }
+
+    // Поставить устройство в очередь на определение имени (без повторов).
+    void EnqueueName(std::uint64_t address, int address_type) {
+        {
+            std::lock_guard<std::mutex> lock(name_mu);
+            if (name_queue.size() >= 12) return;
+            if (!name_tried.insert(address).second) return;
+            name_queue.emplace_back(address, address_type);
+        }
+    }
+
+    // Фоновый поток: по одному устройству, с паузой между подключениями.
+    void NameWorker() {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        while (!name_stop.load()) {
+            std::pair<std::uint64_t, int> item{0, 0};
+            bool have = false;
+            {
+                std::lock_guard<std::mutex> lock(name_mu);
+                if (!name_queue.empty()) {
+                    item = name_queue.front();
+                    name_queue.pop_front();
+                    have = true;
+                }
+            }
+            if (!have) {
+                Sleep(120);
+                continue;
+            }
+            // Пока идёт соединение с нашим устройством или передача —
+            // не подключаемся к посторонним: это мешает основному обмену.
+            bool busy = false;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                busy = (link == LinkReady || link == LinkTransfer || link == LinkPaused ||
+                        link == LinkConnecting);
+            }
+            if (busy || send_busy.load()) {
+                {
+                    std::lock_guard<std::mutex> lock(name_mu);
+                    name_queue.push_front(item);   // вернём в начало очереди
+                }
+                Sleep(300);
+                continue;
+            }
+
+            const std::wstring name = QueryName(item.first, item.second);
+            if (!name.empty()) SetDeviceName(item.first, name);
+            Sleep(400);
+        }
+        winrt::uninit_apartment();
     }
 
     void SetDeviceName(std::uint64_t address, std::wstring const& name) {
@@ -550,6 +641,16 @@ struct Engine::Impl {
             winrt::uninit_apartment();
             return;
         }
+
+        // Поток определения имён живёт ровно столько же, сколько сканирование.
+        name_stop.store(false);
+        {
+            std::lock_guard<std::mutex> lock(name_mu);
+            name_queue.clear();
+            name_tried.clear();
+        }
+        std::thread name_thread([this] { NameWorker(); });
+
         try {
             BluetoothLEAdvertisementWatcher watcher;
             watcher.ScanningMode(BluetoothLEScanningMode::Active);
@@ -584,6 +685,9 @@ struct Engine::Impl {
         } catch (...) {
             Log(2, L"Сканирование недоступно");
         }
+
+        name_stop.store(true);
+        if (name_thread.joinable()) name_thread.join();
 
         Edit([](Stats& s) {
             s.scanning = false;
@@ -641,6 +745,8 @@ struct Engine::Impl {
                 found->seen = GetTickCount64();
             }
         }
+
+        if (name.empty() && rssi >= -70) EnqueueName(address, address_type);
 
         if (added) {
             Log(marked ? 3 : 0,
@@ -1958,6 +2064,7 @@ struct Engine::Impl {
     // =======================================================================
     void StopScan() {
         scan_stop.store(true);
+        name_stop.store(true);
         JoinThread(scan_thread);
         scan_active.store(false);
     }

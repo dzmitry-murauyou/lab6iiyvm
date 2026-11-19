@@ -190,7 +190,7 @@ public:
         wc.lpszClassName = kClassName;
         if (!RegisterClassExW(&wc)) return false;
 
-        hwnd_ = CreateWindowExW(0, kClassName, L"GATT · Передача файлов",
+        hwnd_ = CreateWindowExW(0, kClassName, L"Лабораторная работа №6",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                                 S(1220), S(840), nullptr, nullptr, inst_, this);
         if (!hwnd_) return false;

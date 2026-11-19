@@ -156,7 +156,6 @@ private:
 
     // Геометрия карточек и элементов (физические пиксели).
     RECT transfer_rc_{}, session_rc_{}, file_rc_{}, log_rc_{};
-    RECT title_rc_{}, subtitle_rc_{};
     int header_right_ = 0;    // правый край шапки из Layout()
     RECT transfer_head_{}, session_head_{}, file_head_{}, log_head_{};
 

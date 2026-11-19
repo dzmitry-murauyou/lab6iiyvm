@@ -45,7 +45,7 @@ const Color Accent(255, 94, 156, 255);
 
 const int Pad = 22;
 const int Gap = 12;
-const int HeaderH = 92;
+const int HeaderH = 44;   // узкая полоса: только индикатор состояния
 const int LogH = 110;
 const int FileH = 156;
 const int PanelW = 352;
@@ -434,8 +434,6 @@ void View::Layout() {
     transfer_rc_ = {pad, S(theme::HeaderH), session_rc_.left - gap, file_rc_.top - gap};
 
     header_right_ = w - pad;
-    title_rc_ = {pad, S(10), w - pad, S(46)};
-    subtitle_rc_ = {pad, S(48), w - pad, S(70)};
 
     // --- карточка «Передача» ----------------------------------------------
     {
@@ -647,33 +645,24 @@ void View::Paint(HDC dc, const RECT& client, const Model& model) {
 }
 
 void View::DrawHeader(Graphics& g, const Model& model) {
-    g.SetClip(RectF(0.0f, 0.0f, (REAL)std::max<LONG>(1, header_right_ + S(theme::Pad)),
+    g.SetClip(RectF(0.0f, 0.0f, (REAL)(header_right_ + S(theme::Pad)),
                     (REAL)S(theme::HeaderH)));
 
+    // В шапке остался только индикатор состояния — название и подзаголовок
+    // убраны, место отдано карточкам.
     const std::wstring status = model.status.empty() ? L"Не подключено" : model.status;
-    const int measured = TextWidth(g, status, f_value_);
-    const int max_w = S(390);
-    const int status_w = std::clamp(measured + S(30), S(140), max_w);
-
-    // Правый край берём из раскладки: раньше он читался из title_rc_, который
-    // эта же функция перезаписывала, и шапка с каждым кадром «уползала» влево.
-    const int status_right = header_right_ > 0 ? header_right_
-                                               : (int)std::max<LONG>(1, title_rc_.right);
-    RECT status_rc{status_right - status_w, S(16), status_right, S(48)};
-
-    const int text_right = std::max(S(theme::Pad) + S(120), (int)status_rc.left - S(20));
-    title_rc_ = {S(theme::Pad), S(11), text_right, S(47)};
-    subtitle_rc_ = {S(theme::Pad), S(49), text_right, S(71)};
-
-    TextG(g, L"GATT · Передача файлов", title_rc_, f_title_, theme::Txt);
-    TextG(g, L"Bluetooth LE · GATT · вариант 8", subtitle_rc_, f_label_, theme::Sub);
-
     const Color state = StateColor(model.state);
-    const int cy = (status_rc.top + status_rc.bottom) / 2;
-    Dot(g, status_rc.left + S(6), cy, S(5), state);
 
-    RECT status_text{status_rc.left + S(20), status_rc.top, status_rc.right, status_rc.bottom};
-    TextG(g, status, status_text, f_value_, state);
+    const int right = header_right_ > 0 ? header_right_ : S(400);
+    const int available = std::max(S(160), right - S(theme::Pad) * 2 - S(20));
+    const int text_w = std::min(TextWidth(g, status, f_value_), available);
+
+    const int cy = S(theme::HeaderH) / 2;
+    Dot(g, S(theme::Pad) + S(5), cy, S(5), state);
+
+    const int text_left = S(theme::Pad) + S(16);
+    RECT status_rc{text_left, 0, text_left + text_w, S(theme::HeaderH)};
+    TextG(g, status, status_rc, f_value_, state);
 
     g.ResetClip();
 }
@@ -727,13 +716,10 @@ void View::DrawTransferCard(Graphics& g, const Model& model) {
         }
     }
 
-    // CRC32: ожидаемая сумма и сумма приёмника.
-    if (show_crc_) {
-        Color color = theme::Dim;
-        if (model.crc_state == 1) color = theme::Good;
-        else if (model.crc_state == 2) color = theme::Bad;
-        const std::wstring text = model.crc.empty() ? L"CRC32 — ещё не проверялся"
-                                                    : (L"CRC32  " + model.crc);
+    // CRC32: показываем только итог проверки (суммы есть в журнале и отчёте).
+    if (show_crc_ && model.crc_state != 0) {
+        const Color color = model.crc_state == 1 ? theme::Good : theme::Bad;
+        const std::wstring text = model.crc_state == 1 ? L"CRC32 совпал" : L"CRC32 не совпал";
         TextG(g, text, crc_rc_, f_label_, color);
     }
 
