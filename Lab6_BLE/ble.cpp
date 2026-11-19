@@ -142,8 +142,11 @@ constexpr unsigned long long kStallMs = 1500;   // нет ACK — пробуем
 constexpr unsigned long long kWindowBytesMax = 8192;  // больше в полёте не держим
 constexpr int kWindowBlocksMax = 32;
 // Как часто приёмник подтверждает принятое.
-constexpr unsigned long long kAckBytes = 2048;  // ACK реже: не отнимаем слот у данных
-constexpr unsigned long long kAckIntervalMs = 60;
+// Подтверждение — тоже PDU, и оно занимает слот в интервале связи, как и
+// блок данных. Поэтому подтверждаем редко: раз в ~3 КБ (6 блоков при MTU 517)
+// или раз в 800 мс, смотря что наступит раньше.
+constexpr unsigned long long kAckBytes = 3060;
+constexpr unsigned long long kAckIntervalMs = 800;
 constexpr int kMaxAttempts = 6;                  // попытки восстановить связь
 
 // ---------------------------------------------------------------------------
@@ -463,6 +466,7 @@ struct Engine::Impl {
     std::atomic<bool> ack_stop{true};
     std::thread ack_thread;
     std::atomic<unsigned long long> ack_sent{0};
+    std::atomic<unsigned long long> ack_sent_count{0};   // сколько ACK реально ушло
 
     HANDLE file = INVALID_HANDLE_VALUE;
     std::wstring r_name;
@@ -2194,6 +2198,7 @@ struct Engine::Impl {
     // упёршись в окно).
     void AckWorker() {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        unsigned long long last_send = 0;
         while (!ack_stop.load()) {
             unsigned long long value = 0;
             {
@@ -2206,12 +2211,19 @@ struct Engine::Impl {
                 }
             }
             if (ack_stop.load()) break;
+            const unsigned long long now = GetTickCount64();
             if (value == 0) {
+                // Страховка раз в секунду. Раньше здесь стояло «если принято
+                // больше, чем подтверждено» без задержки — ACK уходил почти на
+                // каждый блок и отнимал у данных слот в интервале связи.
+                if (now - last_send < 1000) continue;
                 std::lock_guard<std::mutex> lock(recv_mu);
                 if (r_has && r_received > ack_sent.load()) value = r_received;
             }
             if (value > ack_sent.load()) {
                 ack_sent.store(value);
+                last_send = now;
+                ack_sent_count.fetch_add(1);
                 NotifyStatus(Format(L"ACK|%llu", value));
             }
         }
@@ -2486,7 +2498,7 @@ struct Engine::Impl {
         // Замеры: если пауза между блоками ~интервал соединения, значит
         // тормозит звено, а не обработка; если пауза мала, а блоков мало —
         // виноват наш приём.
-        unsigned long long dbg_gap_ms = 0, dbg_work_us = 0, dbg_bps = 0;
+        unsigned long long dbg_gap_ms = 0, dbg_work_us = 0, dbg_bps = 0, dbg_acks = 0;
         bool dbg_log = false;
         {
             const unsigned long long rx_t1 = NowUs();
@@ -2504,6 +2516,7 @@ struct Engine::Impl {
                 dbg_gap_ms = rx_gap_n ? rx_gap_us / rx_gap_n / 1000 : 0;
                 dbg_work_us = rx_work_n ? rx_work_us / rx_work_n : 0;
                 dbg_bps = rx_work_n * 1000 / (now_ms - rx_log_ms);
+                dbg_acks = ack_sent_count.exchange(0) * 1000 / (now_ms - rx_log_ms);
                 rx_gap_us = rx_gap_n = rx_work_us = rx_work_n = 0;
                 rx_log_ms = now_ms;
                 dbg_log = true;
@@ -2511,8 +2524,8 @@ struct Engine::Impl {
         }
         if (dbg_log) {
             Log(0, Format(L"Приём: %llu блоков/с, пауза между блоками ~%llu мс, "
-                          L"обработка ~%llu мкс",
-                          dbg_bps, dbg_gap_ms, dbg_work_us));
+                          L"обработка ~%llu мкс, ACK %llu/с",
+                          dbg_bps, dbg_gap_ms, dbg_work_us, dbg_acks));
         }
 
         if (progress) {
