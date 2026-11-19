@@ -483,6 +483,7 @@ struct Engine::Impl {
     std::thread ack_thread;
     std::atomic<unsigned long long> ack_sent{0};
     std::atomic<unsigned long long> ack_sent_count{0};   // сколько ACK реально ушло
+    std::atomic<bool> rx_write_kind_logged{false};
 
     HANDLE file = INVALID_HANDLE_VALUE;
     std::wstring r_name;
@@ -1240,7 +1241,7 @@ struct Engine::Impl {
                               L"больший MTU, скорость будет низкой",
                               pdu, chunk));
             }
-            Log(0, Format(L"MTU %d → блок данных %d байт, окно %d байт", pdu, chunk,
+            Log(0, Format(L"MTU %d · блок %d Б · окно %d Б · Central", pdu, chunk,
                           (int)kWindowBytesTarget));
 
             {
@@ -1659,6 +1660,25 @@ struct Engine::Impl {
             window_blocks = (int)std::clamp<unsigned long long>(
                 kWindowBytesTarget / (unsigned long long)safe_chunk,
                 (unsigned long long)kWindowBlocksMin, (unsigned long long)kWindowBlocksMax);
+            // Повторная просьба уже на живом соединении: при подключении стек
+            // мог её проигнорировать, а интервал — единственное, что осталось
+            // между нами и десятками КБ/с.
+            {
+                BluetoothLEDevice dev = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(snd_mu);
+                    dev = device;
+                }
+                if (dev) {
+                    try {
+                        dev.RequestPreferredConnectionParameters(
+                            BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
+                        Log(0, L"Повторно запрошен скоростной профиль соединения");
+                    } catch (...) {
+                    }
+                }
+            }
+
             Log(0, Format(L"Параметры потока: блок %d байт, окно %d блоков (%d байт), "
                           L"каналов данных %d",
                           chunk_now, window_blocks, chunk_now * window_blocks,
@@ -1770,11 +1790,11 @@ struct Engine::Impl {
                         last_progress_log = now;
                         const unsigned long long w_ms = write_n ? write_us / write_n / 1000 : 0;
                         const unsigned long long a_ms = ack_wait_n ? ack_wait_us / ack_wait_n / 1000 : 0;
-                        Log(0, Format(L"Прогресс: %s из %s, %s/с, блок %d Б, окно %d, "
-                                      L"запись ~%llu мс, ожидание ACK ~%llu мс",
-                                      SizeText(ack_now).c_str(), SizeText(size).c_str(),
+                        Log(0, Format(L"%s/с · запись %llu мс · блок %d Б · окно %d · "
+                                      L"%s из %s",
                                       SizeText((unsigned long long)(speed > 0 ? speed : 0)).c_str(),
-                                      chunk, window_blocks, w_ms, a_ms));
+                                      w_ms, chunk, window_blocks,
+                                      SizeText(ack_now).c_str(), SizeText(size).c_str()));
                         write_us = write_n = ack_wait_us = ack_wait_n = 0;
                         // Если запись стоит десятки миллисекунд — упёрлись не в
                         // программу, а в интервал соединения. Скажем об этом
@@ -2048,16 +2068,25 @@ struct Engine::Impl {
     void OnDataWrite(GattWriteRequestedEventArgs const& args) {
         auto deferral = args.GetDeferral();
         std::vector<std::uint8_t> bytes;
+        bool with_response = false;
         try {
             auto request = args.GetRequestAsync().get();
             bytes = FromBuffer(request.Value());
-            if (request.Option() == GattWriteOption::WriteWithResponse) request.Respond();
+            with_response = request.Option() == GattWriteOption::WriteWithResponse;
+            if (with_response) request.Respond();
         } catch (...) {
         }
         // Освобождаем deferral ДО записи в файл: стек сразу может принять
         // следующий блок, а не ждать, пока мы сходим на диск.
         deferral.Complete();
         if (!bytes.empty()) EnqueueData(std::move(bytes));
+        // Один раз в журнал: Write Command (без подтверждения ATT) быстрый,
+        // Write Request ждёт ответа на каждом блоке — это в разы медленнее.
+        if (!rx_write_kind_logged.exchange(true)) {
+            Log(0, with_response
+                       ? L"Блоки приходят как Write Request (с ответом ATT) — медленный режим"
+                       : L"Блоки приходят как Write Command (без ответа ATT) — как требуется");
+        }
     }
 
     // Поток разбора принятых блоков: только файл и подтверждения.
@@ -2175,10 +2204,11 @@ struct Engine::Impl {
         if (has_client) {
             {
                 const int mtu_now = CentralMtu();
-                Log(3, L"Central подключился к GATT-серверу · " + CentralText() +
-                           (mtu_now > 0 ? Format(L" · MTU %d, блок %d байт", mtu_now,
-                                                 std::max(8, mtu_now - 7))
-                                        : std::wstring()));
+                Log(mtu_now > 0 ? 0 : 3,
+                    (mtu_now > 0 ? Format(L"MTU %d · блок %d Б · ", mtu_now,
+                                          std::max(8, mtu_now - 7))
+                                 : std::wstring()) +
+                        L"Central подключился · " + CentralText());
             }
             const std::wstring central_mac = CentralMac();
             Edit([&](Stats& s) {
@@ -2605,8 +2635,7 @@ struct Engine::Impl {
             }
         }
         if (dbg_log) {
-            Log(0, Format(L"Приём: %llu блоков/с, пауза между блоками ~%llu мс, "
-                          L"обработка ~%llu мкс, ACK %llu/с",
+            Log(0, Format(L"%llu бл/с · пауза %llu мс · обраб. %llu мкс · ACK %llu/с",
                           dbg_bps, dbg_gap_ms, dbg_work_us, dbg_acks));
         }
 
