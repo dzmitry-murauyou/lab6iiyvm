@@ -515,6 +515,16 @@ struct Engine::Impl {
         return name;
     }
 
+    // Разовая попытка определить имя (по выбору устройства в списке).
+    void ResolveName(std::uint64_t address, int address_type) {
+        std::thread([this, address, address_type] {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            const std::wstring name = QueryName(address, address_type);
+            if (!name.empty()) SetDeviceName(address, name);
+            winrt::uninit_apartment();
+        }).detach();
+    }
+
     // Поставить устройство в очередь на определение имени (без повторов).
     void EnqueueName(std::uint64_t address, int address_type) {
         {
@@ -548,8 +558,9 @@ struct Engine::Impl {
             bool busy = false;
             {
                 std::lock_guard<std::mutex> lock(mu);
-                busy = (link == LinkReady || link == LinkTransfer || link == LinkPaused ||
-                        link == LinkConnecting);
+                const LinkState state = stats.link;
+                busy = (state == LinkReady || state == LinkTransfer || state == LinkPaused ||
+                        state == LinkConnecting);
             }
             if (busy || send_busy.load()) {
                 {

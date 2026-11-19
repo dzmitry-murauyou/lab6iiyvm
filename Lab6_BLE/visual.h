@@ -44,8 +44,6 @@ enum : int {
     ID_BROWSE,
     ID_SEND,
     ID_CANCEL,
-    ID_OPEN_DIR,
-    ID_REPORT,
     ID_LOG,
 };
 
@@ -61,19 +59,12 @@ struct Model {
     std::wstring transferred;
     std::wstring speed;
     std::wstring eta;
-    std::wstring chunks;
-    std::wstring crc;      // «1A2B3C4D → 1A2B3C4D»
+    std::wstring crc;      // суммы CRC32 (для журнала и отчёта)
     int crc_state = 0;     // 0 — нет данных, 1 — совпал, 2 — ошибка
     double progress = 0.0;
 
     std::wstring device;
-    std::wstring rssi;
-    std::wstring mtu;
-    std::wstring channel;
-    std::wstring service;
     std::wstring role_name;
-
-    std::vector<float> speed_hist;
 
     bool has_devices = false;
     bool scanning = false;
@@ -142,7 +133,7 @@ private:
     HWND h_role_ = nullptr, h_device_ = nullptr, h_scan_ = nullptr;
     HWND h_connect_ = nullptr, h_disconnect_ = nullptr;
     HWND h_file_ = nullptr, h_browse_ = nullptr, h_send_ = nullptr, h_cancel_ = nullptr;
-    HWND h_open_dir_ = nullptr, h_report_ = nullptr, h_log_ = nullptr;
+    HWND h_log_ = nullptr;
     HBRUSH field_brush_ = nullptr;
 
     Gdiplus::Font* f_title_ = nullptr;
@@ -161,11 +152,11 @@ private:
 
     RECT name_rc_{}, path_rc_{}, percent_rc_{}, chip_rc_{}, bar_rc_{};
     RECT cell_rc_[3]{};          // «Передано», «Скорость», «Осталось»
-    RECT crc_rc_{}, graph_rc_{}, graph_head_{};
+    RECT crc_rc_{};
 
     RECT role_label_{}, device_label_{}, dir_label_{}, file_label_strip_{};
     RECT file_edit_rc_{}, separator_rc_{};
-    RECT info_rc_[5]{};          // строки «подпись — значение» в карточке «Сеанс»
+    RECT info_rc_[2]{};          // строки «подпись — значение» в карточке «Сеанс»
 
     struct Toast {
         std::wstring text;
@@ -176,10 +167,9 @@ private:
 
     int separator_y_ = 0;
     int info_top_ = 0;
-    int rows_ = 5;
+    int rows_ = 1;
     bool show_path_ = true;
     bool show_crc_ = true;
-    bool show_graph_ = true;
     bool show_dir_label_ = true;
     unsigned int enabled_mask_ = 0xFFFFFFFFu;
 };

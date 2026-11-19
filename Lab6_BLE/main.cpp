@@ -76,22 +76,10 @@ std::wstring NowStamp(bool milliseconds) {
                                  st.wHour, st.wMinute, st.wSecond);
 }
 
-std::wstring FileStamp() {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    return Format(L"%04u%02u%02u_%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
-                  st.wSecond);
-}
-
 std::wstring JoinPath(const std::wstring& dir, const std::wstring& name) {
     if (dir.empty()) return name;
     const wchar_t last = dir.back();
     return (last == L'\\' || last == L'/') ? dir + name : dir + L"\\" + name;
-}
-
-std::wstring FileName(const std::wstring& path) {
-    const size_t pos = path.find_last_of(L"\\/");
-    return (pos == std::wstring::npos) ? path : path.substr(pos + 1);
 }
 
 bool DirExists(const std::wstring& path) {
@@ -192,7 +180,7 @@ public:
 
         hwnd_ = CreateWindowExW(0, kClassName, L"Лабораторная работа №6",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                                S(1220), S(840), nullptr, nullptr, inst_, this);
+                                S(1160), S(664), nullptr, nullptr, inst_, this);
         if (!hwnd_) return false;
 
         ShowWindow(hwnd_, show);
@@ -391,12 +379,6 @@ private:
             case ID_CANCEL:
                 if (code == BN_CLICKED) engine_.Cancel();
                 break;
-            case ID_OPEN_DIR:
-                if (code == BN_CLICKED) OpenIncomingDir();
-                break;
-            case ID_REPORT:
-                if (code == BN_CLICKED) SaveReport();
-                break;
             default:
                 break;
         }
@@ -518,10 +500,6 @@ private:
         }
     }
 
-    void OpenIncomingDir() {
-        EnsureDir(incoming_dir_);
-        ShellExecuteW(hwnd_, L"open", incoming_dir_.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    }
 
     // -----------------------------------------------------------------------
     //  Обновление модели
@@ -695,12 +673,6 @@ private:
         model.speed = SpeedText(stats.speed);
         model.eta = TimeText(stats.eta);
 
-        if (stats.role == ble::RoleSender) {
-            model.chunks = Format(L"%llu · ACK %llu", stats.chunks, stats.acks);
-        } else {
-            model.chunks = Format(L"%llu", stats.chunks);
-        }
-
         if (stats.has_crc && (stats.crc_actual != 0 || stats.crc_ok || stats.transfer == ble::TrDone ||
                               stats.transfer == ble::TrFailed)) {
             model.crc = Format(L"%08X  →  %08X", stats.crc_expected, stats.crc_actual);
@@ -714,12 +686,7 @@ private:
         }
 
         model.device = stats.device;
-        model.rssi = stats.rssi == -127 ? std::wstring(L"—") : Format(L"%d дБм", stats.rssi);
-        model.mtu = stats.mtu > 0 ? Format(L"%d · блок %d Б", stats.mtu, stats.payload) : L"—";
-        model.channel = L"Write Without Response";
-        model.service = L"A1B2…4C5D";
         model.role_name = model.sender ? L"Central" : L"Peripheral";
-        model.speed_hist = stats.speed_hist;
     }
 
     // -----------------------------------------------------------------------
@@ -728,8 +695,6 @@ private:
     void AddLog(int level, const std::wstring& text) {
         if (text.empty()) return;
         const std::wstring line = NowStamp(true) + L"  " + text;
-        log_.push_back(line);
-        if (log_.size() > 2000) log_.erase(log_.begin());
 
         view_.AddLogLine(line, level);
 
@@ -755,55 +720,6 @@ private:
         if (!cleaned_) SetTimer(hwnd_, TIMER_TOAST, 80, nullptr);
     }
 
-    void SaveReport() {
-        EnsureDir(incoming_dir_);
-        const std::wstring path = JoinPath(incoming_dir_, L"report_" + FileStamp() + L".txt");
-
-        std::wstring text;
-        text += L"Лабораторная работа №6 — вариант 8\r\n";
-        text += L"Передача файла по Bluetooth LE через GATT (Write Without Response, CRC32)\r\n";
-        text += L"Отчёт сформирован: " + NowStamp(false) + L"\r\n";
-        text += std::wstring(78, L'=') + L"\r\n\r\n";
-
-        text += L"Роль:            " + std::wstring(stats_.role == ble::RoleSender
-                                                       ? L"отправитель (GATT Central)"
-                                                       : L"приёмник (GATT Peripheral)") +
-                L"\r\n";
-        text += L"Устройство:      " + (stats_.device.empty() ? std::wstring(L"—") : stats_.device) +
-                L"\r\n";
-        text += L"Файл:            " + (stats_.file.empty() ? std::wstring(L"—") : stats_.file) +
-                L"\r\n";
-        if (stats_.total > 0) {
-            text += L"Размер:          " + SizeText(stats_.total) + L"\r\n";
-            text += L"Передано:        " + SizeText(stats_.done) + L"\r\n";
-        }
-        if (stats_.has_crc) {
-            text += Format(L"CRC32:           %08X (отправитель) / %08X (приёмник) — %s\r\n",
-                           stats_.crc_expected, stats_.crc_actual,
-                           stats_.crc_ok ? L"совпал" : L"не проверен или не совпал");
-        }
-        text += Format(L"MTU:             %d (данные в блоке: %d)\r\n", stats_.mtu, stats_.payload);
-        text += L"Сервис:          A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D\r\n";
-        text += L"Характеристики:  Control …4C61, Data …4C62, Status …4C63\r\n";
-        text += L"\r\nЖурнал событий:\r\n";
-        for (const auto& line : log_) text += line + L"\r\n";
-        if (log_.empty()) text += L"(журнал пуст)\r\n";
-
-        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE) {
-            AddLog(2, L"Не удалось сохранить отчёт: " + FileName(path));
-            return;
-        }
-        const std::string utf8 = ToUtf8(text);
-        DWORD written = 0;
-        static const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
-        WriteFile(file, bom, 3, &written, nullptr);
-        WriteFile(file, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
-        CloseHandle(file);
-
-        AddLog(3, L"Отчёт сохранён: " + FileName(path));
-    }
 
     void Cleanup() {
         if (cleaned_) return;
@@ -834,7 +750,6 @@ private:
     std::vector<size_t> device_order_;   // индекс в комбобоксе → индекс в Devices()
     std::wstring scan_label_;
     size_t devices_count_ = 0;
-    std::vector<std::wstring> log_;
 };
 
 }  // namespace

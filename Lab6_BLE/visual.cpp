@@ -47,7 +47,7 @@ const int Pad = 22;
 const int Gap = 12;
 const int HeaderH = 44;   // узкая полоса: только индикатор состояния
 const int LogH = 110;
-const int FileH = 156;
+const int FileH = 112;
 const int PanelW = 352;
 const int RowH = 22;
 const int InnerPad = 16;
@@ -214,97 +214,7 @@ void ProgressBar(Graphics& g, const RECT& rc, double progress, const Color& acce
     }
 }
 
-// График скорости: заливка + линия по истории значений.
-void SpeedGraph(Graphics& g, const RECT& rc, const std::vector<float>& history, Font* font) {
-    if (rc.right - rc.left < 40 || rc.bottom - rc.top < 30) return;
-
-    RoundedRect(g, rc, Color(200, 10, 15, 26), theme::Line, S(theme::Radius * 4) / 8.0f);
-
-    const int left = rc.left + S(8);
-    const int right = rc.right - S(8);
-    const int top = rc.top + S(8);
-    const int bottom = rc.bottom - S(8);
-    if (right - left < 20 || bottom - top < 12) return;
-
-    Pen grid(Color(60, 120, 150, 200), 1.0f);
-    for (int i = 1; i <= 2; ++i) {
-        const int y = top + (bottom - top) * i / 3;
-        g.DrawLine(&grid, (REAL)left, (REAL)y, (REAL)right, (REAL)y);
-    }
-
-    if (history.size() < 2) {
-        Pen base(Color(90, 120, 150, 200), 1.0f);
-        g.DrawLine(&base, (REAL)left, (REAL)(bottom - 1), (REAL)right, (REAL)(bottom - 1));
-        RECT text_rc{left, top, right, bottom};
-        TextG(g, L"накопление данных…", text_rc, font, theme::Dim, StringAlignmentCenter);
-        return;
-    }
-
-    float maximum = 0.0f;
-    for (float value : history) maximum = std::max(maximum, value);
-    if (maximum < 1.0f) maximum = 1.0f;
-
-    const int count = (int)history.size();
-    std::vector<PointF> points;
-    points.reserve((size_t)count);
-    for (int i = 0; i < count; ++i) {
-        const REAL x = (REAL)left + (REAL)(right - left) * (count == 1 ? 0.5f : (REAL)i / (count - 1));
-        const float ratio = std::clamp(history[(size_t)i] / maximum, 0.0f, 1.0f);
-        const REAL y = (REAL)(bottom - 1) - (REAL)(bottom - top - 2) * ratio;
-        points.push_back(PointF(x, y));
-    }
-
-    GraphicsPath area;
-    area.AddLine(points.front().X, (REAL)(bottom - 1), points.front().X, points.front().Y);
-    for (size_t i = 1; i < points.size(); ++i) area.AddLine(points[i - 1], points[i]);
-    area.AddLine(points.back().X, points.back().Y, points.back().X, (REAL)(bottom - 1));
-    area.CloseFigure();
-
-    LinearGradientBrush fill(RectF((REAL)left, (REAL)top, (REAL)(right - left),
-                                   (REAL)(bottom - top)),
-                             Color(120, 94, 156, 255), Color(10, 94, 156, 255),
-                             LinearGradientModeVertical);
-    g.FillPath(&fill, &area);
-
-    Pen line(theme::Accent, 1.6f);
-    g.DrawLines(&line, points.data(), (INT)points.size());
-
-    // Максимум шкалы — справа сверху, чтобы график читался без осей.
-    std::wstring label = L"макс ";
-    {
-        wchar_t buffer[64];
-        if (maximum >= 1024.0f * 1024.0f) {
-            _snwprintf_s(buffer, _countof(buffer), _TRUNCATE, L"%.1f МБ/с",
-                         maximum / (1024.0f * 1024.0f));
-        } else if (maximum >= 1024.0f) {
-            _snwprintf_s(buffer, _countof(buffer), _TRUNCATE, L"%.1f КБ/с", maximum / 1024.0f);
-        } else {
-            _snwprintf_s(buffer, _countof(buffer), _TRUNCATE, L"%.0f Б/с", maximum);
-        }
-        label += buffer;
-    }
-    RECT label_rc{left, top, right, top + S(16)};
-    TextG(g, label, label_rc, font, theme::Dim, StringAlignmentFar);
-}
-
 }  // namespace
-
-// ---------------------------------------------------------------------------
-//  Жизненный цикл
-// ---------------------------------------------------------------------------
-View::~View() { Destroy(); }
-
-bool View::Create(HWND parent, HINSTANCE inst) {
-    parent_ = parent;
-    inst_ = inst;
-    field_brush_ = CreateSolidBrush(RGB(12, 18, 30));
-    RecreateFonts();
-    CreateControls();
-    ApplyFontsToControls();
-    created_ = true;
-    Layout();
-    return true;
-}
 
 void View::Destroy() {
     for (Font** font : {&f_title_, &f_section_, &f_label_, &f_value_, &f_button_, &f_log_,
@@ -359,8 +269,6 @@ void View::CreateControls() {
     h_browse_ = Make(L"BUTTON", L"Обзор…", BS_OWNERDRAW | WS_TABSTOP, ID_BROWSE);
     h_send_ = Make(L"BUTTON", L"Отправить", BS_OWNERDRAW | WS_TABSTOP, ID_SEND);
     h_cancel_ = Make(L"BUTTON", L"Отменить", BS_OWNERDRAW | WS_TABSTOP, ID_CANCEL);
-    h_open_dir_ = Make(L"BUTTON", L"Открыть папку", BS_OWNERDRAW | WS_TABSTOP, ID_OPEN_DIR);
-    h_report_ = Make(L"BUTTON", L"Сохранить отчёт", BS_OWNERDRAW | WS_TABSTOP, ID_REPORT);
 
     h_file_ = Make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, ID_FILE);
     h_log_ = Make(L"LISTBOX", L"",
@@ -479,13 +387,6 @@ void View::Layout() {
             crc_rc_ = RECT{0, 0, 0, 0};
         }
 
-        graph_head_ = {left, y, right, y + S(18)};
-        graph_rc_ = {left, y + S(20), right, bottom_limit};
-        show_graph_ = (graph_rc_.bottom - graph_rc_.top) >= S(44);
-        if (!show_graph_) {
-            graph_head_ = graph_rc_ = RECT{0, 0, 0, 0};
-        }
-
     }
 
     // --- карточка «Сеанс» --------------------------------------------------
@@ -522,9 +423,9 @@ void View::Layout() {
         const int row_h = S(theme::RowH);
         const int bottom_limit = session_rc_.bottom - S(10);
 
-        rows_ = 3;   // Связь / RSSI / MTU — остальное ушло в журнал
+        rows_ = 1;   // только состояние связи
         while (rows_ > 0 && bottom_limit - info_top_ < rows_ * row_h) --rows_;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 2; ++i) {
             const int y_row = info_top_ + i * row_h;
             info_rc_[i] = {left, y_row, right, y_row + row_h};
         }
@@ -557,12 +458,6 @@ void View::Layout() {
         SetWindowPos(h_send_, nullptr, left, y2, w1, S(30), SWP_NOZORDER);
         SetWindowPos(h_cancel_, nullptr, left + w1 + gap2, y2,
                      std::max(S(100), (int)right - (left + w1 + gap2)), S(30), SWP_NOZORDER);
-
-        const int y3 = file_rc_.top + S(104);
-        const int half_w = avail_w / 2;
-        SetWindowPos(h_open_dir_, nullptr, left, y3, half_w, S(28), SWP_NOZORDER);
-        SetWindowPos(h_report_, nullptr, left + half_w + gap2, y3,
-                     (int)right - (left + half_w + gap2), S(28), SWP_NOZORDER);
     }
 
     // --- карточка «Журнал» -------------------------------------------------
@@ -608,12 +503,9 @@ void View::SetEnabled(const Model& model) {
     EnableWindow(h_file_, sender ? TRUE : FALSE);
     EnableWindow(h_send_, (sender && !busy) ? TRUE : FALSE);
     EnableWindow(h_cancel_, (sender && busy) ? TRUE : FALSE);
-    EnableWindow(h_open_dir_, TRUE);
-    EnableWindow(h_report_, TRUE);
 
     // Owner-draw кнопки не перерисовываются сами при смене состояния.
-    for (HWND button : {h_scan_, h_connect_, h_disconnect_, h_browse_, h_send_, h_cancel_,
-                        h_open_dir_, h_report_}) {
+    for (HWND button : {h_scan_, h_connect_, h_disconnect_, h_browse_, h_send_, h_cancel_}) {
         InvalidateRect(button, nullptr, FALSE);
     }
 }
@@ -723,12 +615,6 @@ void View::DrawTransferCard(Graphics& g, const Model& model) {
         TextG(g, text, crc_rc_, f_label_, color);
     }
 
-    // График скорости.
-    if (show_graph_) {
-        TextG(g, L"Скорость во времени", graph_head_, f_small_, theme::Sub);
-        SpeedGraph(g, graph_rc_, model.speed_hist, f_small_);
-    }
-
     g.ResetClip();
 }
 
@@ -745,9 +631,9 @@ void View::DrawSessionCard(Graphics& g, const Model& model) {
 
     Separator(g, session_rc_, separator_y_);
 
-    const std::wstring values[3] = {model.device, model.rssi, model.mtu};
-    const wchar_t* labels[3] = {L"Связь:", L"RSSI:", L"MTU:"};
-    for (int i = 0; i < rows_ && i < 3; ++i) {
+    const std::wstring values[1] = {model.device};
+    const wchar_t* labels[1] = {L"Связь:"};
+    for (int i = 0; i < rows_ && i < 1; ++i) {
         Row(g, session_rc_, info_rc_[i].top, labels[i], values[i], f_label_, f_value_);
     }
 
