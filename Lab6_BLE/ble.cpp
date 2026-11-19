@@ -148,10 +148,16 @@ constexpr int kMaxPdu = 517;                     // практический м�
 // оставалось в состоянии «Подключение…» до перезапуска.
 template <typename Op>
 bool AwaitOp(Op const& op, unsigned ms) {
-    try {
-        return op.wait_for(std::chrono::milliseconds(ms)) == winrt::AsyncStatus::Completed;
-    } catch (...) {
-        return false;
+    using winrt::Windows::Foundation::AsyncStatus;
+    const unsigned long long start = GetTickCount64();
+    for (;;) {
+        try {
+            if (op.Status() != AsyncStatus::Started) return op.Status() == AsyncStatus::Completed;
+        } catch (...) {
+            return false;
+        }
+        if (GetTickCount64() - start >= ms) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
 
@@ -1577,7 +1583,8 @@ struct Engine::Impl {
             // Без таймаута «зависшая» запись блокировала весь поток отправки:
             // передача стояла на 0 %.
             if (!AwaitOp(block.op, 4000)) {
-                LogWriteError(Format(L"блок со смещением %llu · нет завершения за 4 с",
+                LogWriteError(Format(L"блок со смещением %llu · не завершился за 4 с "
+                                     L"или завершился ошибкой",
                                      block.offset),
                               GattCommunicationStatus::Unreachable);
                 try {
