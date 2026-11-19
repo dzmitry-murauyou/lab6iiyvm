@@ -500,7 +500,9 @@ struct Engine::Impl {
                         DataReader reader = DataReader::FromBuffer(res.Value());
                         std::vector<std::uint8_t> bytes(reader.UnconsumedBufferLength());
                         if (!bytes.empty()) reader.ReadBytes(bytes);
-                        name = Wide(std::string(bytes.begin(), bytes.end()));
+                        std::string raw(bytes.size(), '\0');
+                        for (std::size_t i = 0; i < bytes.size(); ++i) raw[i] = (char)bytes[i];
+                        name = Wide(raw);   // имя в GAP-характеристике — UTF-8
                     }
                 }
             }
@@ -558,7 +560,7 @@ struct Engine::Impl {
             bool busy = false;
             {
                 std::lock_guard<std::mutex> lock(mu);
-                const LinkState state = stats.link;
+                const LinkState state = static_cast<LinkState>(stats.link);
                 busy = (state == LinkReady || state == LinkTransfer || state == LinkPaused ||
                         state == LinkConnecting);
             }
