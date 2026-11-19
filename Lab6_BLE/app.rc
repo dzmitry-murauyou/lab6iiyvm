@@ -18,7 +18,7 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription",  "BLE GATT file transfer (Lab 6)"
+            VALUE "FileDescription",  "Передача файлов по Bluetooth LE"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "Lab6_BLE"
             VALUE "OriginalFilename", "Lab6_BLE.exe"

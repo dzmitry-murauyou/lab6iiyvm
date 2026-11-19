@@ -43,14 +43,14 @@ const Color Btn(255, 30, 42, 64);
 const Color BtnHot(255, 42, 58, 86);
 const Color Accent(255, 94, 156, 255);
 
-const int Pad = 22;
-const int Gap = 12;
-const int HeaderH = 44;   // узкая полоса: только индикатор состояния
-const int LogH = 110;
-const int FileH = 112;
+const int Pad = 18;
+const int Gap = 10;
+const int HeaderH = 40;   // узкая полоса: только индикатор состояния
+const int LogH = 96;
+const int FileH = 104;
 const int PanelW = 352;
 const int RowH = 22;
-const int InnerPad = 16;
+const int InnerPad = 14;
 const int Radius = 6;   // в DIP; масштабируется через S(), поэтому целое
 
 }  // namespace theme
@@ -373,7 +373,7 @@ void View::Layout() {
         name_rc_ = {left, y, right, y + S(26)};
         y += S(28);
 
-        show_path_ = (bottom_limit - y) >= S(215);
+        show_path_ = (bottom_limit - y) >= S(170);
         if (show_path_) {
             path_rc_ = {left, y, right, y + S(18)};
             y += S(22);
@@ -396,7 +396,7 @@ void View::Layout() {
         }
         y += S(38);
 
-        show_crc_ = (bottom_limit - y) >= S(100);
+        show_crc_ = (bottom_limit - y) >= S(52);
         if (show_crc_) {
             crc_rc_ = {left, y, right, y + S(20)};
             y += S(26);

@@ -178,9 +178,9 @@ public:
         wc.lpszClassName = kClassName;
         if (!RegisterClassExW(&wc)) return false;
 
-        hwnd_ = CreateWindowExW(0, kClassName, L"Лабораторная работа №6",
+        hwnd_ = CreateWindowExW(0, kClassName, L"Передача файлов по Bluetooth",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                                S(1160), S(664), nullptr, nullptr, inst_, this);
+                                S(1000), S(600), nullptr, nullptr, inst_, this);
         if (!hwnd_) return false;
 
         ShowWindow(hwnd_, show);
@@ -341,7 +341,7 @@ private:
         DragAcceptFiles(hwnd_, TRUE);
 
         SetTimer(hwnd_, TIMER_UI, 150, nullptr);
-        AddLog(0, L"Приложение запущено · ЛР №6, вариант 8 (BLE GATT, Write Without Response)");
+        AddLog(0, L"Приложение запущено · приём и передача файлов по Bluetooth LE");
         AddLog(0, L"Каталог приёма: " + incoming_dir_);
 
         Refresh();
