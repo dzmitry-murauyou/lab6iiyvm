@@ -336,6 +336,7 @@ private:
         engine_.SetNotifyWindow(hwnd_);
         engine_.SetIncomingDir(incoming_dir_);
         engine_.SetRole(ble::RoleSender);
+        engine_.RefreshLocalMac();   // «Мой MAC» виден сразу после запуска
 
         SendMessageW(view_.RoleCombo(), CB_SETCURSEL, 0, 0);
         DragAcceptFiles(hwnd_, TRUE);
@@ -388,12 +389,7 @@ private:
         const int sel = (int)SendMessageW(view_.RoleCombo(), CB_GETCURSEL, 0, 0);
         const ble::Role role = sel == 1 ? ble::RoleReceiver : ble::RoleSender;
 
-        engine_.SetRole(role);
-        if (role == ble::RoleReceiver) {
-            engine_.StopScan();
-        } else {
-            engine_.StopReceiving();
-        }
+        engine_.SetRole(role);   // останавливает всё лишнее и пишет роль в журнал
 
         SendMessageW(view_.DeviceCombo(), CB_RESETCONTENT, 0, 0);
         device_signature_.clear();
@@ -402,11 +398,17 @@ private:
 
         SetWindowTextW(view_.FileEdit(),
                        role == ble::RoleSender ? send_path_.c_str() : incoming_dir_.c_str());
-        SetWindowTextW(GetDlgItem(hwnd_, ID_SCAN), role == ble::RoleSender ? L"Поиск" : L"Старт");
 
-        AddLog(0, role == ble::RoleSender
-                      ? L"Роль: отправитель (GATT Central) — передача файла на приёмник"
-                      : L"Роль: приёмник (GATT Peripheral) — приём файла от Central");
+        // Не заставляем искать кнопку: приём стартует сразу (иначе «Мой MAC»
+        // и реклама появлялись только после ручного «Старт»), скан — тоже.
+        if (role == ble::RoleReceiver) {
+            engine_.StartReceiving();
+            AddLog(0, L"Приём запущен: идёт BLE-реклама, ждём подключения отправителя");
+        } else {
+            engine_.ClearDevices();
+            engine_.StartScan();
+            AddLog(0, L"Поиск устройств запущен");
+        }
         Refresh();
     }
 

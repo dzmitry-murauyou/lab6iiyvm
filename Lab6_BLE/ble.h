@@ -114,6 +114,7 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     void SetNotifyWindow(HWND hwnd);          // куда посылать kUpdateMessage
+    void RefreshLocalMac();                   // узнать MAC своего адаптера
     void SetIncomingDir(const std::wstring& dir);
     std::wstring IncomingDir() const;
 

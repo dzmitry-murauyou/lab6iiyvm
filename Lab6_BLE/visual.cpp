@@ -499,7 +499,7 @@ void View::SetEnabled(const Model& model) {
     unsigned int mask = 0;
     auto put = [&mask](bool value) { mask = (mask << 1) | (value ? 1u : 0u); };
     put(!busy);                                              // роль
-    put(sender);                                             // поиск/приём
+    put(true);                                               // поиск/приём (нужна в обеих ролях)
     put(sender && model.has_devices);                        // устройство
     put(sender && model.has_devices && !model.connected);    // подключить
     put(sender && model.connected);                          // отключить
@@ -512,7 +512,7 @@ void View::SetEnabled(const Model& model) {
     enabled_mask_ = mask;
 
     EnableWindow(h_role_, busy ? FALSE : TRUE);
-    EnableWindow(h_scan_, sender ? TRUE : FALSE);
+    EnableWindow(h_scan_, TRUE);
     EnableWindow(h_device_, (sender && model.has_devices) ? TRUE : FALSE);
     EnableWindow(h_connect_, (sender && model.has_devices && !model.connected) ? TRUE : FALSE);
     EnableWindow(h_disconnect_, (sender && model.connected) ? TRUE : FALSE);

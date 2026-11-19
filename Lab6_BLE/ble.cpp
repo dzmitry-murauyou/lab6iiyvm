@@ -384,6 +384,7 @@ struct Engine::Impl {
     std::thread link_thread;
     std::thread send_thread;
     std::thread recv_thread;
+    std::thread mac_thread;   // разовый запрос MAC своего адаптера
 
     // ---------------- отправитель: соединение ----------------
     std::mutex snd_mu;
@@ -1301,6 +1302,32 @@ struct Engine::Impl {
     std::uint64_t LinkAddress() {
         std::lock_guard<std::mutex> lock(snd_mu);
         return link_address;
+    }
+
+    // MAC своего адаптера узнаём сразу после выбора роли: в роли приёмника
+    // это адрес, на который должен целиться отправитель, и ждать нажатия
+    // «Старт» для его показа незачем.
+    void QueryLocalMac() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!stats.local_mac.empty()) return;
+        }
+        JoinThread(mac_thread);
+        mac_thread = std::thread([this] {
+            try {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                BluetoothAdapter adapter = BluetoothAdapter::GetDefaultAsync().get();
+                if (adapter) {
+                    const std::wstring mac = MacText(adapter.BluetoothAddress());
+                    if (!mac.empty()) {
+                        Edit([&](Stats& s) { s.local_mac = mac; });
+                        Log(0, L"Мой MAC: " + mac);
+                    }
+                }
+                winrt::uninit_apartment();
+            } catch (...) {
+            }
+        });
     }
 
     std::wstring LocalMac() {
@@ -2281,6 +2308,8 @@ struct Engine::Impl {
                       LocalMac().c_str()));
 
             Log(3, L"GATT-сервис опубликован. Идёт BLE-реклама — ожидание Central…");
+            Log(0, L"На отправителе выберите в списке «Приёмник Lab6 (" + LocalMac() +
+                       L")» и нажмите «Подключить».");
             Edit([](Stats& s) {
                 s.role = RoleReceiver;
                 s.link = LinkAdvertising;
@@ -2424,6 +2453,8 @@ Engine::~Engine() { Shutdown(); }
 
 void Engine::SetNotifyWindow(HWND hwnd) { impl_->notify = hwnd; }
 
+void Engine::RefreshLocalMac() { impl_->QueryLocalMac(); }
+
 void Engine::SetIncomingDir(const std::wstring& dir) {
     std::lock_guard<std::mutex> lock(impl_->mu);
     impl_->incoming_dir = dir;
@@ -2447,7 +2478,9 @@ void Engine::SetRole(Role role) {
     {
         std::lock_guard<std::mutex> lock(d.mu);
         d.devices.clear();
+        const std::wstring keep_mac = d.stats.local_mac;
         d.stats = Stats{};
+        d.stats.local_mac = keep_mac;   // свой MAC не зависит от роли
         d.stats.role = (int)role;
         d.stats.status =
             role == RoleSender ? L"Сканирование не запущено" : L"Приём не запущен";
@@ -2458,8 +2491,9 @@ void Engine::SetRole(Role role) {
     d.scan_stop.store(true);
     d.recv_stop.store(true);
 
-    d.Log(0, role == RoleSender ? L"Роль: отправитель (GATT Central)"
-                                : L"Роль: приёмник (GATT Peripheral)");
+    d.Log(0, role == RoleSender ? L"Роль: отправитель (GATT Central) — передача файла на приёмник"
+                                : L"Роль: приёмник (GATT Peripheral) — приём файла от Central");
+    d.QueryLocalMac();
     d.NotifyUi();
 }
 
@@ -2693,6 +2727,7 @@ std::vector<LogEntry> Engine::TakeLog() {
 void Engine::Shutdown() {
     Impl& d = *impl_;
     d.cancel.store(true);
+    JoinThread(d.mac_thread);
     d.StopSending();
     d.StopScan();
     d.StopReceiving();
