@@ -371,6 +371,13 @@ void View::CreateControls() {
 
     // Роли фиксированы: отправитель работает как Central, приёмник — как
     // Peripheral (GATT-сервер). Порядок совпадает с ble::Role.
+    // Высота элемента задаётся явно: у owner-draw списка закрытая часть имеет
+    // высоту элемента, и без этого она «уезжает» относительно макета.
+    SendMessageW(h_role_, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)S(22));
+    SendMessageW(h_role_, CB_SETITEMHEIGHT, 0, (LPARAM)S(22));
+    SendMessageW(h_device_, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)S(22));
+    SendMessageW(h_device_, CB_SETITEMHEIGHT, 0, (LPARAM)S(22));
+
     SendMessageW(h_role_, CB_ADDSTRING, 0, (LPARAM)L"Отправитель (Central)");
     SendMessageW(h_role_, CB_ADDSTRING, 0, (LPARAM)L"Приёмник (Peripheral)");
     SendMessageW(h_role_, CB_SETCURSEL, 0, 0);
@@ -458,15 +465,12 @@ void View::Layout() {
         bar_rc_ = {left, y, right, y + S(12)};
         y += S(24);
 
-        const int cell_w = (right - left - gap) / 2;
-        for (int i = 0; i < 4; ++i) {
-            const int col = i % 2;
-            const int row = i / 2;
-            const int x = left + col * (cell_w + gap);
-            const int cell_y = y + row * S(38);
-            cell_rc_[i] = {x, cell_y, x + cell_w, cell_y + S(36)};
+        const int cell_w = (right - left - 2 * gap) / 3;
+        for (int i = 0; i < 3; ++i) {
+            const int x = left + i * (cell_w + gap);
+            cell_rc_[i] = {x, y, x + cell_w, y + S(36)};
         }
-        y += 2 * S(38);
+        y += S(38);
 
         show_crc_ = (bottom_limit - y) >= S(100);
         if (show_crc_) {
@@ -522,7 +526,7 @@ void View::Layout() {
         const int bottom_limit = session_rc_.bottom - S(10);
         const int hint_h = S(24);
 
-        rows_ = 5;
+        rows_ = 3;   // Связь / RSSI / MTU — остальное ушло в журнал
         show_hint_ = false;
         if (bottom_limit - info_top_ >= rows_ * row_h + hint_h) {
             show_hint_ = true;
@@ -667,8 +671,7 @@ void View::DrawHeader(Graphics& g, const Model& model) {
     subtitle_rc_ = {S(theme::Pad), S(49), text_right, S(71)};
 
     TextG(g, L"GATT · Передача файлов", title_rc_, f_title_, theme::Txt);
-    TextG(g, L"Bluetooth LE · вариант 8 · Write Without Response · CRC32", subtitle_rc_, f_label_,
-          theme::Sub);
+    TextG(g, L"Bluetooth LE · GATT · вариант 8", subtitle_rc_, f_label_, theme::Sub);
 
     const Color state = StateColor(model.state);
     const int cy = (status_rc.top + status_rc.bottom) / 2;
@@ -714,11 +717,11 @@ void View::DrawTransferCard(Graphics& g, const Model& model) {
 
     ProgressBar(g, bar_rc_, model.progress, phase_color);
 
-    // Четыре показателя: передано / скорость / осталось / блоков.
+    // Три показателя: передано / скорость / осталось.
     {
-        const wchar_t* labels[4] = {L"Передано", L"Скорость", L"Осталось", L"Блоков"};
-        const std::wstring values[4] = {model.transferred, model.speed, model.eta, model.chunks};
-        for (int i = 0; i < 4; ++i) {
+        const wchar_t* labels[3] = {L"Передано", L"Скорость", L"Осталось"};
+        const std::wstring values[3] = {model.transferred, model.speed, model.eta};
+        for (int i = 0; i < 3; ++i) {
             RECT rc = cell_rc_[i];
             if (rc.right <= rc.left) continue;
             RECT label_rc{rc.left, rc.top, rc.right, rc.top + S(16)};
@@ -770,10 +773,9 @@ void View::DrawSessionCard(Graphics& g, const Model& model) {
 
     Separator(g, session_rc_, separator_y_);
 
-    const std::wstring values[5] = {model.device, model.rssi, model.mtu, model.channel,
-                                    model.service};
-    const wchar_t* labels[5] = {L"Связь:", L"RSSI:", L"MTU:", L"Блок:", L"Сервис:"};
-    for (int i = 0; i < rows_ && i < 5; ++i) {
+    const std::wstring values[3] = {model.device, model.rssi, model.mtu};
+    const wchar_t* labels[3] = {L"Связь:", L"RSSI:", L"MTU:"};
+    for (int i = 0; i < rows_ && i < 3; ++i) {
         Row(g, session_rc_, info_rc_[i].top, labels[i], values[i], f_label_, f_value_);
     }
 

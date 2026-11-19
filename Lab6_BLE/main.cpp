@@ -376,6 +376,12 @@ private:
             case ID_DISCONNECT:
                 if (code == BN_CLICKED) engine_.Disconnect();
                 break;
+            case ID_DEVICE:
+                if (code == CBN_SELCHANGE) {
+                    const int sel = (int)SendMessageW(view_.DeviceCombo(), CB_GETCURSEL, 0, 0);
+                    if (sel >= 0) engine_.RequestName(DeviceIndex(sel));
+                }
+                break;
             case ID_BROWSE:
                 if (code == BN_CLICKED) BrowseFile();
                 break;
@@ -410,6 +416,7 @@ private:
         SendMessageW(view_.DeviceCombo(), CB_RESETCONTENT, 0, 0);
         device_signature_.clear();
         devices_count_ = 0;
+        device_order_.clear();
 
         SetWindowTextW(view_.FileEdit(),
                        role == ble::RoleSender ? send_path_.c_str() : incoming_dir_.c_str());
@@ -451,7 +458,7 @@ private:
             AddLog(1, L"Сначала выберите устройство в списке");
             return;
         }
-        if (!engine_.Connect((size_t)sel)) {
+        if (!engine_.Connect(DeviceIndex(sel))) {
             AddLog(1, L"Подключение не запущено");
         }
     }
@@ -502,7 +509,7 @@ private:
                 AddLog(1, L"Выберите устройство в списке (сначала «Поиск»)");
                 return;
             }
-            engine_.Connect((size_t)sel);   // задаём адрес; передача сама дождётся связи
+            engine_.Connect(DeviceIndex(sel));   // задаём адрес; передача ждёт связи
         }
 
         send_path_ = path;
@@ -544,13 +551,36 @@ private:
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
+    // Индекс, выбранный в комбобоксе, → индекс в списке движка.
+    size_t DeviceIndex(int combo_index) const {
+        if (combo_index < 0 || (size_t)combo_index >= device_order_.size()) return 0;
+        return device_order_[(size_t)combo_index];
+    }
+
     void RefreshDeviceCombo(const ble::Stats& stats) {
         if (stats.role != ble::RoleSender) return;
 
         const std::vector<ble::DeviceInfo> devices = engine_.Devices();
 
+        // Отбрасываем «шум»: устройства без имени и с очень слабым сигналом
+        // только засоряют список. Свой сервис показываем всегда и первым.
+        std::vector<size_t> order;
+        order.reserve(devices.size());
+        for (size_t i = 0; i < devices.size(); ++i) {
+            const ble::DeviceInfo& device = devices[i];
+            if (device.has_service || !device.name.empty() || device.rssi >= -88) {
+                order.push_back(i);
+            }
+        }
+        std::stable_sort(order.begin(), order.end(), [&devices](size_t a, size_t b) {
+            return devices[a].has_service > devices[b].has_service;
+        });
+        const size_t kMaxDevices = 24;
+        if (order.size() > kMaxDevices) order.resize(kMaxDevices);
+
         std::wstring signature;
-        for (const auto& device : devices) {
+        for (size_t index : order) {
+            const ble::DeviceInfo& device = devices[index];
             signature += Format(L"%016llX|%s|%d;", (unsigned long long)device.address,
                                 device.name.c_str(), device.has_service ? 1 : 0);
         }
@@ -564,10 +594,16 @@ private:
         const int previous = (int)SendMessageW(view_.DeviceCombo(), CB_GETCURSEL, 0, 0);
         SendMessageW(view_.DeviceCombo(), CB_RESETCONTENT, 0, 0);
 
-        for (const auto& device : devices) {
+        device_order_ = order;
+
+        for (size_t index : order) {
+            const ble::DeviceInfo& device = devices[index];
             std::wstring text;
             if (!device.name.empty()) {
                 text = device.name;
+            } else if (device.has_service) {
+                // Наш приёмник рекламируется без имени — подписываем понятно.
+                text = L"Приёмник Lab6";
             } else {
                 text = L"Без имени";
             }
@@ -581,17 +617,17 @@ private:
             // Тип BLE-адреса: public выдаётся производителем, random генерирует
             // хост (смартфоны, трекеры) — полезно при идентификации устройства.
             if (device.address_type == 1) text += L"  (random)";
-            if (device.has_service) text += L"   •  Lab6";
+            if (device.has_service && !device.name.empty()) text += L"   •  Lab6";
             SendMessageW(view_.DeviceCombo(), CB_ADDSTRING, 0, (LPARAM)text.c_str());
         }
 
-        devices_count_ = devices.size();
-        if (!devices.empty()) {
+        devices_count_ = order.size();
+        if (!order.empty()) {
             int select = previous;
-            if (select < 0 || select >= (int)devices.size()) {
+            if (select < 0 || select >= (int)order.size()) {
                 select = 0;
-                for (size_t i = 0; i < devices.size(); ++i) {
-                    if (devices[i].has_service) {
+                for (size_t i = 0; i < order.size(); ++i) {
+                    if (devices[order[i]].has_service) {
                         select = (int)i;
                         break;
                     }
@@ -679,7 +715,7 @@ private:
 
         model.device = stats.device;
         model.rssi = stats.rssi == -127 ? std::wstring(L"—") : Format(L"%d дБм", stats.rssi);
-        model.mtu = stats.mtu > 0 ? Format(L"%d Б · данные %d", stats.mtu, stats.payload) : L"—";
+        model.mtu = stats.mtu > 0 ? Format(L"%d · блок %d Б", stats.mtu, stats.payload) : L"—";
         model.channel = L"Write Without Response";
         model.service = L"A1B2…4C5D";
         model.role_name = model.sender ? L"Central" : L"Peripheral";
@@ -801,6 +837,7 @@ private:
     std::wstring incoming_dir_;
     std::wstring send_path_;
     std::wstring device_signature_;
+    std::vector<size_t> device_order_;   // индекс в комбобоксе → индекс в Devices()
     std::wstring scan_label_;
     size_t devices_count_ = 0;
     std::vector<std::wstring> log_;

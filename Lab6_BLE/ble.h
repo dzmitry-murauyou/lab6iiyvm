@@ -123,6 +123,7 @@ public:
     std::vector<DeviceInfo> Devices() const;
     void ClearDevices();
     bool Connect(std::size_t index);          // индекс в списке Devices()
+    void RequestName(std::size_t index);      // догрузить имя из системы (если есть)
     void Disconnect();
     bool StartSend(const std::wstring& path);
     void Cancel();

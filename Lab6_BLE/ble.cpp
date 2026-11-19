@@ -454,6 +454,46 @@ struct Engine::Impl {
     // =======================================================================
     //  СКАНИРОВАНИЕ (Central)
     // =======================================================================
+    // Имя устройства из системного кэша: у большинства BLE-устройств его нет
+    // в рекламном пакете (оно приходит только в scan response или читается из
+    // GAP-сервиса). Windows знает имена уже виденных устройств — забираем имя
+    // по запросу, в фоне, чтобы не тормозить сканирование.
+    void ResolveName(std::uint64_t address, int address_type) {
+        std::thread([this, address, address_type] {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            try {
+                const BluetoothAddressType type = address_type == 1 ? BluetoothAddressType::Random
+                                                                   : BluetoothAddressType::Public;
+                BluetoothLEDevice dev = BluetoothLEDevice::FromBluetoothAddressAsync(address, type).get();
+                if (dev) {
+                    const std::wstring name = dev.Name().c_str();
+                    dev.Close();
+                    if (!name.empty()) SetDeviceName(address, name);
+                }
+            } catch (...) {
+            }
+            winrt::uninit_apartment();
+        }).detach();
+    }
+
+    void SetDeviceName(std::uint64_t address, std::wstring const& name) {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            for (auto& device : devices) {
+                if (device.address == address && device.name != name) {
+                    device.name = name;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (changed) {
+            Log(0, Format(L"Имя устройства %s: %s", MacText(address).c_str(), name.c_str()));
+            NotifyUi();
+        }
+    }
+
     // Возможности Bluetooth-адаптера. Нужны, чтобы отличить «нет адаптера»,
     // «адаптер без BLE» и «адаптер без роли Peripheral» (частый случай у
     // дешёвых USB-донглов со сторонним стеком: реклама и GATT-сервер в этом
@@ -813,6 +853,7 @@ struct Engine::Impl {
                 target = address;
                 target_type = address_type;
                 target_name = name;
+                if (!name.empty()) SetDeviceName(address, name);
                 mtu = pdu;
                 payload = chunk;
             }
@@ -2048,6 +2089,22 @@ void Engine::ClearDevices() {
     std::lock_guard<std::mutex> lock(impl_->mu);
     impl_->devices.clear();
     impl_->NotifyUi();
+}
+
+void Engine::RequestName(std::size_t index) {
+    Impl& d = *impl_;
+    std::uint64_t address = 0;
+    int address_type = 0;
+    bool need = false;
+    {
+        std::lock_guard<std::mutex> lock(d.mu);
+        if (index < d.devices.size() && d.devices[index].name.empty()) {
+            address = d.devices[index].address;
+            address_type = d.devices[index].address_type;
+            need = true;
+        }
+    }
+    if (need) d.ResolveName(address, address_type);
 }
 
 bool Engine::Connect(std::size_t index) {

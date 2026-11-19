@@ -161,7 +161,7 @@ private:
     RECT transfer_head_{}, session_head_{}, file_head_{}, log_head_{};
 
     RECT name_rc_{}, path_rc_{}, percent_rc_{}, chip_rc_{}, bar_rc_{};
-    RECT cell_rc_[4]{};          // «Передано», «Скорость», «Осталось», «Блоков»
+    RECT cell_rc_[3]{};          // «Передано», «Скорость», «Осталось»
     RECT crc_rc_{}, graph_rc_{}, graph_head_{};
     RECT hint_rc_{};          // подсказка в карточке «Передача»
     RECT session_hint_rc_{};  // подсказка в карточке «Сеанс»
