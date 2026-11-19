@@ -216,6 +216,23 @@ void ProgressBar(Graphics& g, const RECT& rc, double progress, const Color& acce
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+//  Жизненный цикл
+// ---------------------------------------------------------------------------
+View::~View() { Destroy(); }
+
+bool View::Create(HWND parent, HINSTANCE inst) {
+    parent_ = parent;
+    inst_ = inst;
+    field_brush_ = CreateSolidBrush(RGB(12, 18, 30));
+    RecreateFonts();
+    CreateControls();
+    ApplyFontsToControls();
+    created_ = true;
+    Layout();
+    return true;
+}
+
 void View::Destroy() {
     for (Font** font : {&f_title_, &f_section_, &f_label_, &f_value_, &f_button_, &f_log_,
                         &f_big_, &f_small_}) {
