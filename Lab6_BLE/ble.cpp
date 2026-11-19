@@ -130,14 +130,20 @@ constexpr int kMaxPdu = 517;                     // практический м�
 // Окно неподтверждённых данных. Write Without Response не повторяет записи:
 // если залить больше, чем буфер приёмника, блоки теряются и передача встаёт
 // на бесконечных пересылках. Поэтому окно маленькое и адаптивное.
+inline unsigned long long NowUs() {
+    return (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 constexpr unsigned long long kWindowBytesTarget = 4096;   // сколько байт держим «в полёте»
 constexpr int kWindowBlocksMin = 4;
 constexpr unsigned long long kStallMs = 1500;   // нет ACK — пробуем откатиться
 constexpr unsigned long long kWindowBytesMax = 8192;  // больше в полёте не держим
 constexpr int kWindowBlocksMax = 32;
 // Как часто приёмник подтверждает принятое.
-constexpr unsigned long long kAckBytes = 192;   // подтверждаем почти каждый блок
-constexpr unsigned long long kAckIntervalMs = 10;
+constexpr unsigned long long kAckBytes = 2048;  // ACK реже: не отнимаем слот у данных
+constexpr unsigned long long kAckIntervalMs = 60;
 constexpr int kMaxAttempts = 6;                  // попытки восстановить связь
 
 // ---------------------------------------------------------------------------
@@ -467,6 +473,13 @@ struct Engine::Impl {
     unsigned long long r_chunks = 0;
     unsigned long long r_ack_mark = 0;
     unsigned long long r_last_ack = 0;
+    // Замеры приёмной стороны: пауза между блоками и время обработки.
+    unsigned long long rx_prev_us = 0;
+    unsigned long long rx_gap_us = 0;
+    unsigned long long rx_gap_n = 0;
+    unsigned long long rx_work_us = 0;
+    unsigned long long rx_work_n = 0;
+    unsigned long long rx_log_ms = 0;
     unsigned long long r_last_ui = 0;
     bool r_has = false;
     bool r_done = false;
@@ -1056,6 +1069,19 @@ struct Engine::Impl {
                 return false;
             }
 
+            // Просим у стека «скоростной» профиль соединения: интервал
+            // 11.25–15 мс вместо обычных 30–150 мс. Это только просьба, но
+            // именно интервал определяет скорость при MTU 517.
+            try {
+                dev.RequestPreferredConnectionParameters(
+                    BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
+                Log(0, L"Запрошен скоростной профиль соединения (интервал ~15 мс) · MAC " +
+                           MacText(address));
+            } catch (...) {
+                Log(1, L"Стек не поддерживает запрос параметров соединения — интервал "
+                        L"назначает Central сам · MAC " + MacText(address));
+            }
+
             GattSession sess = nullptr;
             try {
                 sess = GattSession::FromDeviceIdAsync(dev.BluetoothDeviceId()).get();
@@ -1560,6 +1586,11 @@ struct Engine::Impl {
         int window_blocks = 8;
         int stall_count = 0;
         std::deque<PendingBlock> pending;   // записи «в полёте»
+        // Замеры: сколько занимает одна запись в стеке и сколько мы ждём ACK.
+        unsigned long long write_us = 0, write_n = 0;
+        unsigned long long ack_wait_us = 0, ack_wait_n = 0;
+        const unsigned long long loop_start = GetTickCount64();
+        bool slow_hint_done = false;
         {
             int chunk_now = 0;
             {
@@ -1629,8 +1660,13 @@ struct Engine::Impl {
                 }
 
                 if (cursor >= ack_now && cursor - ack_now >= window) {
-                    std::unique_lock<std::mutex> lock(snd_mu);
-                    snd_cv.wait_for(lock, 120ms);
+                    const unsigned long long wait_t0 = NowUs();
+                    {
+                        std::unique_lock<std::mutex> lock(snd_mu);
+                        snd_cv.wait_for(lock, 120ms);
+                    }
+                    ack_wait_us += NowUs() - wait_t0;
+                    ++ack_wait_n;
                     continue;
                 }
 
@@ -1652,7 +1688,11 @@ struct Engine::Impl {
                 // интервал соединения (это и давало единицы КБ/с).
                 const std::size_t in_flight = (std::size_t)std::max(2, std::min(window_blocks, 16));
                 while (pending.size() >= in_flight) {
-                    if (!FinishOldestWrite(pending)) throw LinkLost("блок не записан");
+                    const unsigned long long w_t0 = NowUs();
+                    const bool written = FinishOldestWrite(pending);
+                    write_us += NowUs() - w_t0;
+                    ++write_n;
+                    if (!written) throw LinkLost("блок не записан");
                 }
                 if (!StartWriteBlock(cursor, buffer.data(), got, pending)) {
                     throw LinkLost("блок не записан");
@@ -1669,10 +1709,26 @@ struct Engine::Impl {
                     // идёт ли передача и с какой реальной скоростью.
                     if (now - last_progress_log >= 2000) {
                         last_progress_log = now;
-                        Log(0, Format(L"Прогресс: %s из %s, %s/с, окно %d блоков",
+                        const unsigned long long w_ms = write_n ? write_us / write_n / 1000 : 0;
+                        const unsigned long long a_ms = ack_wait_n ? ack_wait_us / ack_wait_n / 1000 : 0;
+                        Log(0, Format(L"Прогресс: %s из %s, %s/с, блок %d Б, окно %d, "
+                                      L"запись ~%llu мс, ожидание ACK ~%llu мс",
                                       SizeText(ack_now).c_str(), SizeText(size).c_str(),
                                       SizeText((unsigned long long)(speed > 0 ? speed : 0)).c_str(),
-                                      window_blocks));
+                                      chunk, window_blocks, w_ms, a_ms));
+                        write_us = write_n = ack_wait_us = ack_wait_n = 0;
+                        // Если запись стоит десятки миллисекунд — упёрлись не в
+                        // программу, а в интервал соединения. Скажем об этом
+                        // прямо, чтобы не искать виноватого вслепую.
+                        if (!slow_hint_done && now - loop_start >= 4000 && w_ms > 60) {
+                            slow_hint_done = true;
+                            const unsigned long long per_s = 1000 / std::max<unsigned long long>(w_ms, 1);
+                            Log(2, Format(L"Скорость ограничена интервалом соединения: одна запись "
+                                          L"~%llu мс, блок %d Б → ~%llu Б/с. Интервал задаёт стек "
+                                          L"(запрошен скоростной профиль); от программы зависит "
+                                          L"только размер блока и окно.",
+                                          w_ms, chunk, (unsigned long long)chunk * per_s));
+                        }
                     }
                 }
             }
@@ -2340,6 +2396,7 @@ struct Engine::Impl {
     }
 
     void HandleData(std::vector<std::uint8_t> const& bytes) {
+        const unsigned long long rx_t0 = NowUs();
         std::uint32_t offset = 0;
         const std::uint8_t* payload = nullptr;
         std::size_t count = 0;
@@ -2381,6 +2438,38 @@ struct Engine::Impl {
         }
 
         if (need_ack) SignalAck(acknowledged);
+
+        // Замеры: если пауза между блоками ~интервал соединения, значит
+        // тормозит звено, а не обработка; если пауза мала, а блоков мало —
+        // виноват наш приём.
+        unsigned long long dbg_gap_ms = 0, dbg_work_us = 0, dbg_bps = 0;
+        bool dbg_log = false;
+        {
+            const unsigned long long rx_t1 = NowUs();
+            std::lock_guard<std::mutex> lock(recv_mu);
+            if (rx_prev_us && rx_t1 > rx_prev_us) {
+                rx_gap_us += rx_t1 - rx_prev_us;
+                ++rx_gap_n;
+            }
+            rx_prev_us = rx_t1;
+            rx_work_us += rx_t1 - rx_t0;
+            ++rx_work_n;
+            const unsigned long long now_ms = GetTickCount64();
+            if (rx_log_ms == 0) rx_log_ms = now_ms;
+            if (now_ms - rx_log_ms >= 2000) {
+                dbg_gap_ms = rx_gap_n ? rx_gap_us / rx_gap_n / 1000 : 0;
+                dbg_work_us = rx_work_n ? rx_work_us / rx_work_n : 0;
+                dbg_bps = rx_work_n * 1000 / (now_ms - rx_log_ms);
+                rx_gap_us = rx_gap_n = rx_work_us = rx_work_n = 0;
+                rx_log_ms = now_ms;
+                dbg_log = true;
+            }
+        }
+        if (dbg_log) {
+            Log(0, Format(L"Приём: %llu блоков/с, пауза между блоками ~%llu мс, "
+                          L"обработка ~%llu мкс",
+                          dbg_bps, dbg_gap_ms, dbg_work_us));
+        }
 
         if (progress) {
             unsigned long long received = 0;
