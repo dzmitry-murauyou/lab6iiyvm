@@ -13,7 +13,7 @@ Write Without Response, контроль целостности CRC32, подт�
 
 | Возможность | Реализация |
 |---|---|
-| Передача файла Central → Peripheral | GATT-характеристика `Data`, запись **Write Without Response** |
+| Передача файла Central → Peripheral | GATT-характеристика `Data`, запись **Write Without Response** (плюс параллельные каналы `Data2…Data4` того же сервиса, формат кадра и протокол те же) |
 | Максимальная скорость | MTU 23…517, размер блока = `MTU − 3 − 4` байт (4 байта — смещение) |
 | Целостность | CRC-32 (IEEE 802.3) всего файла: считает отправитель до передачи, приёмник — после записи на диск |
 | Подтверждение приёма | Notify-характеристика `Status`: `ACK\|смещение` раз в ~3 КБ или 800 мс (отдельным потоком, без ожидания доставки). Подтверждение — тоже PDU и занимает слот в интервале связи, поэтому оно редкое: 1 ACK на ~6 блоков |
@@ -65,6 +65,9 @@ Write Without Response, контроль целостности CRC32, подт�
 Сервис   A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D
   Control  A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C61  write / write-without-response
   Data     A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C62  write-without-response
+  Data2    A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C64  write-without-response (параллельный канал)
+  Data3    A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C65  write-without-response (параллельный канал)
+  Data4    A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C66  write-without-response (параллельный канал)
   Status   A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C63  notify + read
 ```
 

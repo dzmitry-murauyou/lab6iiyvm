@@ -107,6 +107,19 @@ guid const& DataUuid() {
     static const guid value = MakeGuid(L"A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C62");
     return value;
 }
+// Дополнительные каналы данных: тот же формат кадра, тот же сервис.
+guid const& Data2Uuid() {
+    static const guid value = MakeGuid(L"A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C64");
+    return value;
+}
+guid const& Data3Uuid() {
+    static const guid value = MakeGuid(L"A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C65");
+    return value;
+}
+guid const& Data4Uuid() {
+    static const guid value = MakeGuid(L"A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C66");
+    return value;
+}
 guid const& StatusUuid() {
     static const guid value = MakeGuid(L"A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C63");
     return value;
@@ -413,6 +426,9 @@ struct Engine::Impl {
     GattDeviceService service{nullptr};
     GattCharacteristic ctrl_ch{nullptr};
     GattCharacteristic data_ch{nullptr};
+    GattCharacteristic data2_ch{nullptr};
+    GattCharacteristic data3_ch{nullptr};
+    GattCharacteristic data4_ch{nullptr};
     GattCharacteristic status_ch{nullptr};
     GattSession session{nullptr};
     event_token device_token{};
@@ -474,6 +490,9 @@ struct Engine::Impl {
     unsigned long long r_size = 0;
     unsigned long long r_crc_expect = 0;
     unsigned long long r_received = 0;
+    // Блоки, пришедшие раньше времени: каналы идут параллельно, порядок между
+    // ними не гарантирован, поэтому такие блоки ждут, пока закроется «дырка».
+    std::map<std::uint32_t, std::vector<std::uint8_t>> r_out;
     unsigned long long r_chunks = 0;
     unsigned long long r_ack_mark = 0;
     unsigned long long r_last_ack = 0;
@@ -1159,11 +1178,18 @@ struct Engine::Impl {
             }
 
             GattCharacteristic ctrl = nullptr, data = nullptr, stat = nullptr;
+            GattCharacteristic data2 = nullptr, data3 = nullptr, data4 = nullptr;
             for (auto const& ch : chars.Characteristics()) {
                 if (ch.Uuid() == ControlUuid()) {
                     ctrl = ch;
                 } else if (ch.Uuid() == DataUuid()) {
                     data = ch;
+                } else if (ch.Uuid() == Data2Uuid()) {
+                    data2 = ch;
+                } else if (ch.Uuid() == Data3Uuid()) {
+                    data3 = ch;
+                } else if (ch.Uuid() == Data4Uuid()) {
+                    data4 = ch;
                 } else if (ch.Uuid() == StatusUuid()) {
                     stat = ch;
                 }
@@ -1223,6 +1249,9 @@ struct Engine::Impl {
                 service = svc;
                 ctrl_ch = ctrl;
                 data_ch = data;
+                data2_ch = data2;
+                data3_ch = data3;
+                data4_ch = data4;
                 status_ch = stat;
                 session = sess;
                 value_token = token;
@@ -1303,6 +1332,9 @@ struct Engine::Impl {
             service = nullptr;
             ctrl_ch = nullptr;
             data_ch = nullptr;
+            data2_ch = nullptr;
+            data3_ch = nullptr;
+            data4_ch = nullptr;
             status_ch = nullptr;
             session = nullptr;
             value_subscribed = false;
@@ -1446,15 +1478,15 @@ struct Engine::Impl {
     // Ставит блок в очередь записи, НЕ дожидаясь её завершения. Так в стеке
     // может быть несколько записей сразу, и за интервал соединения уходит
     // несколько блоков, а не один.
-    bool StartWriteBlock(unsigned long long offset, const std::uint8_t* data, std::size_t size,
+    bool StartWriteBlock(GattCharacteristic const& channel, unsigned long long offset,
+                         const std::uint8_t* data, std::size_t size,
                          std::deque<PendingBlock>& pending) {
-        GattCharacteristic ch = nullptr;
         {
             std::lock_guard<std::mutex> lock(snd_mu);
             if (!connected) return false;
-            ch = data_ch;
         }
-        if (!ch) return false;
+        if (!channel) return false;
+        const GattCharacteristic& ch = channel;
 
         std::vector<std::uint8_t> frame;
         EncodeFrame(offset, data, size, frame);
@@ -1598,6 +1630,18 @@ struct Engine::Impl {
         int window_blocks = 8;
         int stall_count = 0;
         std::deque<PendingBlock> pending;   // записи «в полёте»
+        // Каналы данных: Windows пропускает примерно один PDU за интервал
+        // соединения на характеристику, поэтому пишем в несколько сразу.
+        std::vector<GattCharacteristic> channels;
+        {
+            std::lock_guard<std::mutex> lock(snd_mu);
+            if (data_ch) channels.push_back(data_ch);
+            if (data2_ch) channels.push_back(data2_ch);
+            if (data3_ch) channels.push_back(data3_ch);
+            if (data4_ch) channels.push_back(data4_ch);
+        }
+        if (channels.empty()) throw LinkLost("нет характеристики Data");
+        std::size_t ch_index = 0;
         // Замеры: сколько занимает одна запись в стеке и сколько мы ждём ACK.
         unsigned long long write_us = 0, write_n = 0;
         unsigned long long ack_wait_us = 0, ack_wait_n = 0;
@@ -1615,8 +1659,10 @@ struct Engine::Impl {
             window_blocks = (int)std::clamp<unsigned long long>(
                 kWindowBytesTarget / (unsigned long long)safe_chunk,
                 (unsigned long long)kWindowBlocksMin, (unsigned long long)kWindowBlocksMax);
-            Log(0, Format(L"Параметры потока: блок %d байт, окно %d блоков (%d байт)",
-                          chunk_now, window_blocks, chunk_now * window_blocks));
+            Log(0, Format(L"Параметры потока: блок %d байт, окно %d блоков (%d байт), "
+                          L"каналов данных %d",
+                          chunk_now, window_blocks, chunk_now * window_blocks,
+                          (int)channels.size()));
         }
 
         try {
@@ -1706,7 +1752,8 @@ struct Engine::Impl {
                     ++write_n;
                     if (!written) throw LinkLost("блок не записан");
                 }
-                if (!StartWriteBlock(cursor, buffer.data(), got, pending)) {
+                const GattCharacteristic& channel = channels[ch_index++ % channels.size()];
+                if (!StartWriteBlock(channel, cursor, buffer.data(), got, pending)) {
                     throw LinkLost("блок не записан");
                 }
                 cursor += got;
@@ -2297,6 +2344,7 @@ struct Engine::Impl {
                     r_crc_expect = crc;
                     r_received = 0;
                     r_chunks = 0;
+                    r_out.clear();
                     r_ack_mark = 0;
                     ack_sent.store(0);
                     {
@@ -2390,6 +2438,7 @@ struct Engine::Impl {
             r_has = false;
             r_received = 0;
             r_chunks = 0;
+            r_out.clear();
         }
 
         NotifyStatus(Format(L"DONE|%llu|%08X|%s|%s", file_size, actual, ok ? L"OK" : L"MISMATCH",
@@ -2457,6 +2506,7 @@ struct Engine::Impl {
         const std::uint8_t* payload = nullptr;
         std::size_t count = 0;
         if (!DecodeFrame(bytes.data(), bytes.size(), offset, payload, count)) return;
+        if (count == 0) return;
 
         bool need_ack = false;
         bool progress = false;
@@ -2466,30 +2516,62 @@ struct Engine::Impl {
             std::lock_guard<std::mutex> lock(recv_mu);
             if (!r_has || file == INVALID_HANDLE_VALUE || r_done) return;
 
-            if (offset != (std::uint32_t)r_received) {
-                // Дубликат или пропуск: просим повторить с подтверждённой позиции.
+            auto write_chunk = [&](const std::uint8_t* p, std::size_t n) -> bool {
+                DWORD written = 0;
+                const BOOL res = WriteFile(file, p, (DWORD)n, &written, nullptr);
+                return res && written == n;
+            };
+
+            const std::uint32_t off = offset;
+            bool accepted = false;
+            bool failed = false;
+            if (off == (std::uint32_t)r_received) {
+                accepted = true;
+                if (!write_chunk(payload, count)) {
+                    failed = true;
+                } else {
+                    r_received += count;
+                    ++r_chunks;
+                    // Добираем блоки, пришедшие раньше со смежных каналов:
+                    // пишем строго по порядку смещений.
+                    for (;;) {
+                        auto it = r_out.find((std::uint32_t)r_received);
+                        if (it == r_out.end()) break;
+                        std::vector<std::uint8_t> buffered = std::move(it->second);
+                        r_out.erase(it);
+                        if (!write_chunk(buffered.data(), buffered.size())) {
+                            failed = true;
+                            break;
+                        }
+                        r_received += buffered.size();
+                        ++r_chunks;
+                    }
+                }
+            } else if (off > (std::uint32_t)r_received) {
+                // Блок пришёл вперёд (параллельный канал) — держим до «дырки».
+                if (r_out.size() < 1024 && r_out.find(off) == r_out.end()) {
+                    r_out.emplace(off, std::vector<std::uint8_t>(payload, payload + count));
+                }
+            } else {
+                // Дубликат: подтверждаем уже принятую позицию.
                 need_ack = true;
                 acknowledged = r_received;
-            } else {
-                DWORD written = 0;
-                const BOOL ok = WriteFile(file, payload, (DWORD)count, &written, nullptr);
-                if (ok && written == count) {
-                    r_received += written;
-                    ++r_chunks;
-                    const unsigned long long now = GetTickCount64();
-                    if (r_received - r_ack_mark >= kAckBytes ||
-                        now - r_last_ack >= kAckIntervalMs) {
-                        r_ack_mark = r_received;
-                        r_last_ack = now;
-                        need_ack = true;
-                        progress = now - r_last_ui >= 100;
-                        if (progress) r_last_ui = now;
-                    }
-                    acknowledged = r_received;
-                } else {
+            }
+
+            if (failed) {
+                need_ack = true;
+                acknowledged = r_received;
+            } else if (accepted) {
+                const unsigned long long now = GetTickCount64();
+                if (r_received - r_ack_mark >= kAckBytes ||
+                    now - r_last_ack >= kAckIntervalMs) {
+                    r_ack_mark = r_received;
+                    r_last_ack = now;
                     need_ack = true;
-                    acknowledged = r_received;
+                    progress = now - r_last_ui >= 100;
+                    if (progress) r_last_ui = now;
                 }
+                acknowledged = r_received;
             }
         }
 
@@ -2583,8 +2665,11 @@ struct Engine::Impl {
         GattServiceProvider provider_local = nullptr;
         GattLocalCharacteristic ctrl_local = nullptr;
         GattLocalCharacteristic data_local = nullptr;
+        GattLocalCharacteristic data_local2 = nullptr;
+        GattLocalCharacteristic data_local3 = nullptr;
+        GattLocalCharacteristic data_local4 = nullptr;
         GattLocalCharacteristic status_local = nullptr;
-        event_token t_ctrl{}, t_data{}, t_read{}, t_subs{};
+        event_token t_ctrl{}, t_data{}, t_data2{}, t_data3{}, t_data4{}, t_read{}, t_subs{};
 
         try {
             auto result = GattServiceProvider::CreateAsync(ServiceUuid()).get();
@@ -2628,6 +2713,23 @@ struct Engine::Impl {
                 }
                 data_local = created.Characteristic();
             }
+            // Дополнительные каналы данных: Windows отправляет примерно один
+            // PDU за интервал соединения на характеристику, поэтому несколько
+            // характеристик = несколько PDU за интервал. Формат кадра тот же.
+            {
+                const guid extra[3] = {Data2Uuid(), Data3Uuid(), Data4Uuid()};
+                GattLocalCharacteristic* slots[3] = {&data_local2, &data_local3, &data_local4};
+                for (int i = 0; i < 3; ++i) {
+                    GattLocalCharacteristicParameters params;
+                    params.CharacteristicProperties(Props(PropWriteWithoutResponse | PropWrite));
+                    params.WriteProtectionLevel(GattProtectionLevel::Plain);
+                    params.UserDescription(L"Блоки файла (параллельный канал)");
+                    auto created = service.CreateCharacteristicAsync(extra[i], params).get();
+                    if (created.Error() == BluetoothError::Success) {
+                        *slots[i] = created.Characteristic();
+                    }
+                }
+            }
             {
                 GattLocalCharacteristicParameters params;
                 params.CharacteristicProperties(Props(PropNotify | PropRead));
@@ -2648,6 +2750,24 @@ struct Engine::Impl {
                 [this](GattLocalCharacteristic const&, GattWriteRequestedEventArgs const& args) {
                     OnDataWrite(args);
                 });
+            if (data_local2) {
+                t_data2 = data_local2.WriteRequested(
+                    [this](GattLocalCharacteristic const&, GattWriteRequestedEventArgs const& args) {
+                        OnDataWrite(args);
+                    });
+            }
+            if (data_local3) {
+                t_data3 = data_local3.WriteRequested(
+                    [this](GattLocalCharacteristic const&, GattWriteRequestedEventArgs const& args) {
+                        OnDataWrite(args);
+                    });
+            }
+            if (data_local4) {
+                t_data4 = data_local4.WriteRequested(
+                    [this](GattLocalCharacteristic const&, GattWriteRequestedEventArgs const& args) {
+                        OnDataWrite(args);
+                    });
+            }
             t_read = status_local.ReadRequested(
                 [this](GattLocalCharacteristic const&, GattReadRequestedEventArgs const& args) {
                     OnStatusRead(args);
@@ -2688,6 +2808,14 @@ struct Engine::Impl {
             Log(adv_status == GattServiceProviderAdvertisementStatus::Started ? 3 : 2,
                 Format(L"Реклама: %s · мой MAC %s", AdvStatusText(adv_status).c_str(),
                       LocalMac().c_str()));
+
+            {
+                const int n = 1 + (data_local2 ? 1 : 0) + (data_local3 ? 1 : 0) +
+                              (data_local4 ? 1 : 0);
+                Log(0, Format(L"Каналов данных в сервисе: %d (Data…Data4) — до %d блоков "
+                              L"за интервал соединения",
+                              n, n));
+            }
 
             Log(3, L"GATT-сервис опубликован. Идёт BLE-реклама — ожидание Central…");
             Log(0, L"Адрес в BLE-рекламе Windows случайный — он может отличаться от MAC "
@@ -2746,6 +2874,12 @@ struct Engine::Impl {
         }
         try {
             if (data_local) data_local.WriteRequested(t_data);
+        } catch (...) {
+        }
+        try {
+            if (data_local2) data_local2.WriteRequested(t_data2);
+            if (data_local3) data_local3.WriteRequested(t_data3);
+            if (data_local4) data_local4.WriteRequested(t_data4);
         } catch (...) {
         }
         try {
@@ -2830,6 +2964,9 @@ struct Engine::Impl {
         service = nullptr;
         ctrl_ch = nullptr;
         data_ch = nullptr;
+        data2_ch = nullptr;
+        data3_ch = nullptr;
+        data4_ch = nullptr;
         status_ch = nullptr;
         session = nullptr;
     }
