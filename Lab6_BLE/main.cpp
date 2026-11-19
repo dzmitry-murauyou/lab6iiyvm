@@ -156,7 +156,6 @@ class App {
 public:
     enum : UINT {
         TIMER_UI = 1,
-        TIMER_TOAST = 2,
     };
 
     App() = default;
@@ -180,7 +179,7 @@ public:
 
         hwnd_ = CreateWindowExW(0, kClassName, L"Передача файлов по Bluetooth",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                                S(1020), S(700), nullptr, nullptr, inst_, this);
+                                S(1020), S(780), nullptr, nullptr, inst_, this);
         if (!hwnd_) return false;
 
         ShowWindow(hwnd_, show);
@@ -257,11 +256,6 @@ private:
             case WM_TIMER:
                 if (wp == TIMER_UI) {
                     Refresh();
-                    return 0;
-                }
-                if (wp == TIMER_TOAST) {
-                    if (!view_.ExpireToasts()) KillTimer(hwnd_, TIMER_TOAST);
-                    InvalidateRect(hwnd_, nullptr, FALSE);
                     return 0;
                 }
                 return 0;
@@ -578,26 +572,14 @@ private:
 
         for (size_t index : order) {
             const ble::DeviceInfo& device = devices[index];
-            std::wstring text;
-            if (!device.name.empty()) {
-                text = device.name;
-            } else if (device.has_service) {
-                // Наш приёмник рекламируется без имени — подписываем понятно.
-                text = L"Приёмник Lab6";
-            } else {
-                text = L"Без имени";
-            }
-            text += Format(L"  (%02X:%02X:%02X:%02X:%02X:%02X)",
-                           (unsigned)((device.address >> 40) & 0xFF),
-                           (unsigned)((device.address >> 32) & 0xFF),
-                           (unsigned)((device.address >> 24) & 0xFF),
-                           (unsigned)((device.address >> 16) & 0xFF),
-                           (unsigned)((device.address >> 8) & 0xFF),
-                           (unsigned)(device.address & 0xFF));
-            // Тип BLE-адреса: public выдаётся производителем, random генерирует
-            // хост (смартфоны, трекеры) — полезно при идентификации устройства.
-            if (device.address_type == 1) text += L"  (random)";
-            if (device.has_service && !device.name.empty()) text += L"   •  Lab6";
+            // В списке только MAC: имена в рекламе бывают случайными и путают.
+            const std::wstring text = Format(L"%02X:%02X:%02X:%02X:%02X:%02X",
+                                             (unsigned)((device.address >> 40) & 0xFF),
+                                             (unsigned)((device.address >> 32) & 0xFF),
+                                             (unsigned)((device.address >> 24) & 0xFF),
+                                             (unsigned)((device.address >> 16) & 0xFF),
+                                             (unsigned)((device.address >> 8) & 0xFF),
+                                             (unsigned)(device.address & 0xFF));
             SendMessageW(view_.DeviceCombo(), CB_ADDSTRING, 0, (LPARAM)text.c_str());
         }
 
@@ -690,7 +672,7 @@ private:
         model.device = stats.device;
         model.local_mac = stats.local_mac;
         model.peer_mac = stats.peer_mac;
-        model.role_name = model.sender ? L"Central" : L"Peripheral";
+        model.role_name = model.sender ? L"Отправитель" : L"Приёмник";
     }
 
     // -----------------------------------------------------------------------
@@ -700,7 +682,9 @@ private:
         if (text.empty()) return;
         const std::wstring line = NowStamp(true) + L"  " + text;
 
-        view_.AddLogLine(line, level);
+        // Уровень 4 — «только в файл»: подробная диагностика (прогресс,
+        // скорость, MTU) не засоряет журнал на экране, но остаётся в ble_log.txt.
+        if (level < 4) view_.AddLogLine(line, level);
 
         // Дублируем в файл: журнал сохраняется даже при аварийном закрытии.
         if (!incoming_dir_.empty()) {
@@ -720,8 +704,6 @@ private:
             }
         }
 
-        if (level >= 1) view_.PushToast(text, level);
-        if (!cleaned_) SetTimer(hwnd_, TIMER_TOAST, 80, nullptr);
     }
 
 
@@ -730,7 +712,6 @@ private:
         cleaned_ = true;
 
         KillTimer(hwnd_, TIMER_UI);
-        KillTimer(hwnd_, TIMER_TOAST);
         DragAcceptFiles(hwnd_, FALSE);
 
         AddLog(0, L"Приложение закрыто");

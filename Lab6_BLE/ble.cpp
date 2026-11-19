@@ -483,7 +483,6 @@ struct Engine::Impl {
     std::thread ack_thread;
     std::atomic<unsigned long long> ack_sent{0};
     std::atomic<unsigned long long> ack_sent_count{0};   // сколько ACK реально ушло
-    std::atomic<bool> rx_write_kind_logged{false};
 
     HANDLE file = INVALID_HANDLE_VALUE;
     std::wstring r_name;
@@ -497,13 +496,7 @@ struct Engine::Impl {
     unsigned long long r_chunks = 0;
     unsigned long long r_ack_mark = 0;
     unsigned long long r_last_ack = 0;
-    // Замеры приёмной стороны: пауза между блоками и время обработки.
-    unsigned long long rx_prev_us = 0;
-    unsigned long long rx_gap_us = 0;
-    unsigned long long rx_gap_n = 0;
-    unsigned long long rx_work_us = 0;
-    unsigned long long rx_work_n = 0;
-    unsigned long long rx_log_ms = 0;
+    unsigned long long r_last_file_log = 0;
     // Очередь принятых блоков: GATT-сервер отдаёт нам блок, мы копируем байты
     // и сразу освобождаем deferral, а запись в файл идёт в отдельном потоке.
     // Иначе стек ждёт нас и принимает один блок за интервал соединения.
@@ -977,20 +970,9 @@ struct Engine::Impl {
     }
 
     void OnValueChanged(GattValueChangedEventArgs const& args) {
-        // Первое уведомление отмечаем один раз: если ACK не идут, эта строка
-        // в журнале покажет, что подписка работает, а проблема не в ней.
-        bool first_status = false;
-        std::uint64_t address = 0;
         {
             std::lock_guard<std::mutex> lock(snd_mu);
-            if (!status_seen) {
-                status_seen = true;
-                first_status = true;
-                address = link_address;
-            }
-        }
-        if (first_status) {
-            Log(0, L"Первое уведомление Status получено (MAC " + MacText(address) + L")");
+            status_seen = true;
         }
 
         std::vector<std::uint8_t> bytes;
@@ -1102,16 +1084,12 @@ struct Engine::Impl {
             }
 
             // Просим у стека «скоростной» профиль соединения: интервал
-            // 11.25–15 мс вместо обычных 30–150 мс. Это только просьба, но
-            // именно интервал определяет скорость при MTU 517.
+            // 11.25–15 мс вместо обычных 30–150 мс. Это только просьба, и
+            // ошибку не показываем — в журнале от неё только шум.
             try {
                 dev.RequestPreferredConnectionParameters(
                     BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
-                Log(0, L"Запрошен скоростной профиль соединения (интервал ~15 мс) · MAC " +
-                           MacText(address));
             } catch (...) {
-                Log(1, L"Стек не поддерживает запрос параметров соединения — интервал "
-                        L"назначает Central сам · MAC " + MacText(address));
             }
 
             GattSession sess = nullptr;
@@ -1241,8 +1219,7 @@ struct Engine::Impl {
                               L"больший MTU, скорость будет низкой",
                               pdu, chunk));
             }
-            Log(0, Format(L"MTU %d · блок %d Б · окно %d Б · Central", pdu, chunk,
-                          (int)kWindowBytesTarget));
+            Log(0, Format(L"MTU %d · блок %d Б", pdu, chunk));
 
             {
                 std::lock_guard<std::mutex> lock(snd_mu);
@@ -1427,7 +1404,6 @@ struct Engine::Impl {
                     const std::wstring mac = MacText(adapter.BluetoothAddress());
                     if (!mac.empty()) {
                         Edit([&](Stats& s) { s.local_mac = mac; });
-                        Log(0, L"Мой MAC: " + mac);
                     }
                 }
                 winrt::uninit_apartment();
@@ -1627,7 +1603,7 @@ struct Engine::Impl {
         unsigned long long chunks = 0;
         unsigned long long last_ack_tick = GetTickCount64();
         bool ok = true;
-        unsigned long long last_progress_log = GetTickCount64();
+        unsigned long long last_file_log = GetTickCount64();
         int window_blocks = 8;
         int stall_count = 0;
         std::deque<PendingBlock> pending;   // записи «в полёте»
@@ -1643,11 +1619,6 @@ struct Engine::Impl {
         }
         if (channels.empty()) throw LinkLost("нет характеристики Data");
         std::size_t ch_index = 0;
-        // Замеры: сколько занимает одна запись в стеке и сколько мы ждём ACK.
-        unsigned long long write_us = 0, write_n = 0;
-        unsigned long long ack_wait_us = 0, ack_wait_n = 0;
-        const unsigned long long loop_start = GetTickCount64();
-        bool slow_hint_done = false;
         {
             int chunk_now = 0;
             {
@@ -1671,17 +1642,12 @@ struct Engine::Impl {
                 }
                 if (dev) {
                     try {
-                        dev.RequestPreferredConnectionParameters(
-                            BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
-                        Log(0, L"Повторно запрошен скоростной профиль соединения");
                     } catch (...) {
                     }
                 }
             }
 
-            Log(0, Format(L"Параметры потока: блок %d байт, окно %d блоков (%d байт), "
-                          L"каналов данных %d",
-                          chunk_now, window_blocks, chunk_now * window_blocks,
+            Log(0, Format(L"Блок %d Б · окно %d · каналов %d", chunk_now, window_blocks,
                           (int)channels.size()));
         }
 
@@ -1738,13 +1704,8 @@ struct Engine::Impl {
                 }
 
                 if (cursor >= ack_now && cursor - ack_now >= window) {
-                    const unsigned long long wait_t0 = NowUs();
-                    {
-                        std::unique_lock<std::mutex> lock(snd_mu);
-                        snd_cv.wait_for(lock, 120ms);
-                    }
-                    ack_wait_us += NowUs() - wait_t0;
-                    ++ack_wait_n;
+                    std::unique_lock<std::mutex> lock(snd_mu);
+                    snd_cv.wait_for(lock, 120ms);
                     continue;
                 }
 
@@ -1766,11 +1727,7 @@ struct Engine::Impl {
                 // интервал соединения (это и давало единицы КБ/с).
                 const std::size_t in_flight = (std::size_t)std::max(2, std::min(window_blocks, 16));
                 while (pending.size() >= in_flight) {
-                    const unsigned long long w_t0 = NowUs();
-                    const bool written = FinishOldestWrite(pending);
-                    write_us += NowUs() - w_t0;
-                    ++write_n;
-                    if (!written) throw LinkLost("блок не записан");
+                    if (!FinishOldestWrite(pending)) throw LinkLost("блок не записан");
                 }
                 const GattCharacteristic& channel = channels[ch_index++ % channels.size()];
                 if (!StartWriteBlock(channel, cursor, buffer.data(), got, pending)) {
@@ -1784,30 +1741,13 @@ struct Engine::Impl {
                     last_ui = now;
                     const double speed = SampleSpeed(ack_now, false);
                     PublishProgress(ack_now, size, speed, chunks);
-                    // Раз в 2 с — строка прогресса в журнал: по ней видно,
-                    // идёт ли передача и с какой реальной скоростью.
-                    if (now - last_progress_log >= 2000) {
-                        last_progress_log = now;
-                        const unsigned long long w_ms = write_n ? write_us / write_n / 1000 : 0;
-                        const unsigned long long a_ms = ack_wait_n ? ack_wait_us / ack_wait_n / 1000 : 0;
-                        Log(0, Format(L"%s/с · запись %llu мс · блок %d Б · окно %d · "
-                                      L"%s из %s",
+                    // Подробности — только в файл журнала (уровень 4).
+                    if (now - last_file_log >= 5000) {
+                        last_file_log = now;
+                        Log(4, Format(L"Прогресс: %s из %s, %s/с, окно %d",
+                                      SizeText(ack_now).c_str(), SizeText(size).c_str(),
                                       SizeText((unsigned long long)(speed > 0 ? speed : 0)).c_str(),
-                                      w_ms, chunk, window_blocks,
-                                      SizeText(ack_now).c_str(), SizeText(size).c_str()));
-                        write_us = write_n = ack_wait_us = ack_wait_n = 0;
-                        // Если запись стоит десятки миллисекунд — упёрлись не в
-                        // программу, а в интервал соединения. Скажем об этом
-                        // прямо, чтобы не искать виноватого вслепую.
-                        if (!slow_hint_done && now - loop_start >= 4000 && w_ms > 60) {
-                            slow_hint_done = true;
-                            const unsigned long long per_s = 1000 / std::max<unsigned long long>(w_ms, 1);
-                            Log(2, Format(L"Скорость ограничена интервалом соединения: одна запись "
-                                          L"~%llu мс, блок %d Б → ~%llu Б/с. Интервал задаёт стек "
-                                          L"(запрошен скоростной профиль); от программы зависит "
-                                          L"только размер блока и окно.",
-                                          w_ms, chunk, (unsigned long long)chunk * per_s));
-                        }
+                                      window_blocks));
                     }
                 }
             }
@@ -2068,25 +2008,16 @@ struct Engine::Impl {
     void OnDataWrite(GattWriteRequestedEventArgs const& args) {
         auto deferral = args.GetDeferral();
         std::vector<std::uint8_t> bytes;
-        bool with_response = false;
         try {
             auto request = args.GetRequestAsync().get();
             bytes = FromBuffer(request.Value());
-            with_response = request.Option() == GattWriteOption::WriteWithResponse;
-            if (with_response) request.Respond();
+            if (request.Option() == GattWriteOption::WriteWithResponse) request.Respond();
         } catch (...) {
         }
         // Освобождаем deferral ДО записи в файл: стек сразу может принять
         // следующий блок, а не ждать, пока мы сходим на диск.
         deferral.Complete();
         if (!bytes.empty()) EnqueueData(std::move(bytes));
-        // Один раз в журнал: Write Command (без подтверждения ATT) быстрый,
-        // Write Request ждёт ответа на каждом блоке — это в разы медленнее.
-        if (!rx_write_kind_logged.exchange(true)) {
-            Log(0, with_response
-                       ? L"Блоки приходят как Write Request (с ответом ATT) — медленный режим"
-                       : L"Блоки приходят как Write Command (без ответа ATT) — как требуется");
-        }
     }
 
     // Поток разбора принятых блоков: только файл и подтверждения.
@@ -2531,7 +2462,6 @@ struct Engine::Impl {
     }
 
     void HandleData(std::vector<std::uint8_t> const& bytes) {
-        const unsigned long long rx_t0 = NowUs();
         std::uint32_t offset = 0;
         const std::uint8_t* payload = nullptr;
         std::size_t count = 0;
@@ -2607,38 +2537,6 @@ struct Engine::Impl {
 
         if (need_ack) SignalAck(acknowledged);
 
-        // Замеры: если пауза между блоками ~интервал соединения, значит
-        // тормозит звено, а не обработка; если пауза мала, а блоков мало —
-        // виноват наш приём.
-        unsigned long long dbg_gap_ms = 0, dbg_work_us = 0, dbg_bps = 0, dbg_acks = 0;
-        bool dbg_log = false;
-        {
-            const unsigned long long rx_t1 = NowUs();
-            std::lock_guard<std::mutex> lock(recv_mu);
-            if (rx_prev_us && rx_t1 > rx_prev_us) {
-                rx_gap_us += rx_t1 - rx_prev_us;
-                ++rx_gap_n;
-            }
-            rx_prev_us = rx_t1;
-            rx_work_us += rx_t1 - rx_t0;
-            ++rx_work_n;
-            const unsigned long long now_ms = GetTickCount64();
-            if (rx_log_ms == 0) rx_log_ms = now_ms;
-            if (now_ms - rx_log_ms >= 2000) {
-                dbg_gap_ms = rx_gap_n ? rx_gap_us / rx_gap_n / 1000 : 0;
-                dbg_work_us = rx_work_n ? rx_work_us / rx_work_n : 0;
-                dbg_bps = rx_work_n * 1000 / (now_ms - rx_log_ms);
-                dbg_acks = ack_sent_count.exchange(0) * 1000 / (now_ms - rx_log_ms);
-                rx_gap_us = rx_gap_n = rx_work_us = rx_work_n = 0;
-                rx_log_ms = now_ms;
-                dbg_log = true;
-            }
-        }
-        if (dbg_log) {
-            Log(0, Format(L"%llu бл/с · пауза %llu мс · обраб. %llu мкс · ACK %llu/с",
-                          dbg_bps, dbg_gap_ms, dbg_work_us, dbg_acks));
-        }
-
         if (progress) {
             unsigned long long received = 0;
             unsigned long long total = 0;
@@ -2662,6 +2560,12 @@ struct Engine::Impl {
             if (GetTickCount64() - last_sample_ui >= 250) {
                 last_sample_ui = GetTickCount64();
                 PushSpeed(speed);
+            }
+            if (GetTickCount64() - r_last_file_log >= 5000) {
+                r_last_file_log = GetTickCount64();
+                Log(4, Format(L"Приём: %s из %s, %s/с",
+                              SizeText(received).c_str(), SizeText(total).c_str(),
+                              SizeText((unsigned long long)(speed > 0 ? speed : 0)).c_str()));
             }
         }
     }
@@ -2838,24 +2742,12 @@ struct Engine::Impl {
                 Format(L"Реклама: %s · мой MAC %s", AdvStatusText(adv_status).c_str(),
                       LocalMac().c_str()));
 
-            {
-                const int n = 1 + (data_local2 ? 1 : 0) + (data_local3 ? 1 : 0) +
-                              (data_local4 ? 1 : 0);
-                Log(0, Format(L"Каналов данных в сервисе: %d (Data…Data4) — до %d блоков "
-                              L"за интервал соединения",
-                              n, n));
-            }
-
             Log(3, L"GATT-сервис опубликован. Идёт BLE-реклама — ожидание Central…");
-            Log(0, L"Адрес в BLE-рекламе Windows случайный — он может отличаться от MAC "
-                   L"адаптера. На отправителе выбирайте пункт «Приёмник Lab6».");
 
             ack_stop.store(false);
             ack_thread = std::thread([this] { AckWorker(); });
             rxq_stop.store(false);
             rxq_thread = std::thread([this] { RxQueueMain(); });
-            Log(0, L"На отправителе выберите в списке «Приёмник Lab6 (" + LocalMac() +
-                       L")» и нажмите «Подключить».");
             Edit([](Stats& s) {
                 s.role = RoleReceiver;
                 s.link = LinkAdvertising;

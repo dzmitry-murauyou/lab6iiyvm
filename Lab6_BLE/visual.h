@@ -103,8 +103,6 @@ public:
     HWND LogList() const { return h_log_; }
 
     void AddLogLine(const std::wstring& line, int level);
-    void PushToast(const std::wstring& text, int level);
-    bool ExpireToasts();
 
     HBRUSH FieldBrush() const { return field_brush_; }
 
@@ -122,7 +120,6 @@ private:
     void DrawSessionCard(Gdiplus::Graphics& g, const Model& model);
     void DrawFileCard(Gdiplus::Graphics& g, const Model& model);
     void DrawLogCard(Gdiplus::Graphics& g, const Model& model);
-    void DrawToasts(Gdiplus::Graphics& g);
 
     void DrawButton(const DRAWITEMSTRUCT* item);
     void DrawCombo(const DRAWITEMSTRUCT* item);
@@ -160,12 +157,6 @@ private:
     RECT file_edit_rc_{}, separator_rc_{};
     RECT info_rc_[2]{};          // строки «подпись — значение» в карточке «Сеанс»
 
-    struct Toast {
-        std::wstring text;
-        int level = 0;
-        ULONGLONG until = 0;
-    };
-    std::vector<Toast> toasts_;
 
     int separator_y_ = 0;
     int info_top_ = 0;

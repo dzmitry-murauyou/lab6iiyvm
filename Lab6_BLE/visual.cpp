@@ -45,8 +45,8 @@ const Color Accent(255, 94, 156, 255);
 
 const int Pad = 18;
 const int Gap = 10;
-const int HeaderH = 40;   // узкая полоса: только индикатор состояния
-const int LogH = 168;
+const int HeaderH = 46;   // узкая полоса: только индикатор состояния
+const int LogH = 236;     // основной журнал: побольше места событиям
 const int FileH = 104;
 const int PanelW = 352;
 const int RowH = 22;
@@ -303,8 +303,8 @@ void View::CreateControls() {
     SendMessageW(h_device_, CB_SETITEMHEIGHT, (WPARAM)-1, (LPARAM)S(22));
     SendMessageW(h_device_, CB_SETITEMHEIGHT, 0, (LPARAM)S(22));
 
-    SendMessageW(h_role_, CB_ADDSTRING, 0, (LPARAM)L"Отправитель (Central)");
-    SendMessageW(h_role_, CB_ADDSTRING, 0, (LPARAM)L"Приёмник (Peripheral)");
+    SendMessageW(h_role_, CB_ADDSTRING, 0, (LPARAM)L"Отправитель");
+    SendMessageW(h_role_, CB_ADDSTRING, 0, (LPARAM)L"Приёмник");
     SendMessageW(h_role_, CB_SETCURSEL, 0, 0);
 }
 
@@ -336,7 +336,7 @@ int View::MinHeight() const {
     // + высота карточки передачи и запас на заголовок окна и рамку.
     return S(theme::Pad * 2 + theme::HeaderH + theme::Gap + theme::FileH + theme::Gap +
              theme::LogH) +
-           S(280);
+           S(250);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,28 +373,24 @@ void View::Layout() {
         name_rc_ = {left, y, right, y + S(26)};
         y += S(28);
 
-        show_path_ = (bottom_limit - y) >= S(170);
-        if (show_path_) {
-            path_rc_ = {left, y, right, y + S(18)};
-            y += S(22);
-        } else {
-            path_rc_ = RECT{0, 0, 0, 0};
-        }
+        // Путь к файлу больше не занимает строку: место отдано журналу.
+        show_path_ = false;
+        path_rc_ = RECT{0, 0, 0, 0};
 
-        percent_rc_ = {left, y, right, y + S(52)};
+        percent_rc_ = {left, y, right, y + S(46)};
         const int chip_w = S(120);
-        chip_rc_ = {right - chip_w, y + S(16), right, y + S(42)};
-        y += S(56);
+        chip_rc_ = {right - chip_w, y + S(12), right, y + S(38)};
+        y += S(50);
 
         bar_rc_ = {left, y, right, y + S(12)};
-        y += S(24);
+        y += S(22);
 
         const int cell_w = (right - left - 2 * gap) / 3;
         for (int i = 0; i < 3; ++i) {
             const int x = left + i * (cell_w + gap);
-            cell_rc_[i] = {x, y, x + cell_w, y + S(36)};
+            cell_rc_[i] = {x, y, x + cell_w, y + S(34)};
         }
-        y += S(38);
+        y += S(36);
 
         show_crc_ = (bottom_limit - y) >= S(52);
         if (show_crc_) {
@@ -550,7 +546,6 @@ void View::Paint(HDC dc, const RECT& client, const Model& model) {
     DrawSessionCard(g, model);
     DrawFileCard(g, model);
     DrawLogCard(g, model);
-    DrawToasts(g);
 }
 
 void View::DrawHeader(Graphics& g, const Model& model) {
@@ -563,14 +558,18 @@ void View::DrawHeader(Graphics& g, const Model& model) {
     const Color state = StateColor(model.state);
 
     const int right = header_right_ > 0 ? header_right_ : S(400);
-    const int available = std::max(S(160), right - S(theme::Pad) * 2 - S(20));
-    const int text_w = std::min(TextWidth(g, status, f_value_), available);
 
     const int cy = S(theme::HeaderH) / 2;
-    Dot(g, S(theme::Pad) + S(5), cy, S(5), state);
+    Dot(g, S(theme::Pad) + S(6), cy, S(6), state);
 
-    const int text_left = S(theme::Pad) + S(16);
-    RECT status_rc{text_left, 0, text_left + text_w, S(theme::HeaderH)};
+    // Строка состояния занимает всё место справа от индикатора: иначе
+    // «Не подключено» обрезалось по высоте/ширине. Запас по высоте нужен
+    // для выносных элементов букв («д», «у», «р»).
+    const int text_left = S(theme::Pad) + S(20);
+    RECT clip{0, 0, right, S(theme::HeaderH)};
+    g.SetClip(RectF((REAL)clip.left, (REAL)clip.top, (REAL)(clip.right - clip.left),
+                    (REAL)(clip.bottom - clip.top)));
+    RECT status_rc{text_left, -S(2), right, S(theme::HeaderH) + S(6)};
     TextG(g, status, status_rc, f_value_, state);
 
     g.ResetClip();
@@ -648,21 +647,17 @@ void View::DrawSessionCard(Graphics& g, const Model& model) {
 
     Separator(g, session_rc_, separator_y_);
 
-    // У отправителя показываем связь, у приёмника — свой MAC (адрес, на
-    // который целится Central) и MAC подключившегося отправителя.
+    // Свой MAC не показываем: важно только то, с кем идёт обмен.
+    // У приёмника это MAC отправителя, у отправителя — MAC приёмника.
     std::wstring values[2];
     const wchar_t* labels[2] = {L"Связь:", L""};
-    // В рекламе Windows использует случайный адрес, поэтому MAC на стороне
-    // отправителя и MAC адаптера приёмника не совпадают — так и подписано.
     if (model.role == 1) {
-        labels[0] = L"MAC адаптера:";
-        values[0] = model.local_mac.empty() ? L"—" : model.local_mac;
-        labels[1] = L"Отправитель:";
-        values[1] = model.peer_mac.empty() ? L"не подключён" : model.peer_mac;
+        labels[0] = L"Отправитель:";
+        values[0] = model.peer_mac.empty() ? L"не подключён" : model.peer_mac;
     } else {
         values[0] = model.device;
-        labels[1] = L"MAC адаптера:";
-        values[1] = model.local_mac.empty() ? L"—" : model.local_mac;
+        labels[1] = L"Приёмник:";
+        values[1] = model.peer_mac.empty() ? L"—" : model.peer_mac;
     }
     for (int i = 0; i < rows_ && i < 2; ++i) {
         if (labels[i][0] == L'\0') continue;
@@ -707,62 +702,6 @@ void View::DrawLogCard(Graphics& g, const Model& model) {
 // ---------------------------------------------------------------------------
 //  Уведомления
 // ---------------------------------------------------------------------------
-void View::PushToast(const std::wstring& text, int level) {
-    if (text.empty()) return;
-    if (toasts_.size() >= 3) toasts_.erase(toasts_.begin());
-    toasts_.push_back({text, level, GetTickCount64() + 2600});
-}
-
-bool View::ExpireToasts() {
-    const ULONGLONG now = GetTickCount64();
-    toasts_.erase(std::remove_if(toasts_.begin(), toasts_.end(),
-                                 [now](const Toast& t) { return t.until <= now; }),
-                  toasts_.end());
-    return !toasts_.empty();
-}
-
-void View::DrawToasts(Graphics& g) {
-    if (toasts_.empty()) return;
-
-    const ULONGLONG now = GetTickCount64();
-    g.SetClip(RectF((REAL)transfer_rc_.left, (REAL)transfer_rc_.top,
-                    (REAL)(transfer_rc_.right - transfer_rc_.left),
-                    (REAL)(transfer_rc_.bottom - transfer_rc_.top)));
-
-    const int right = transfer_rc_.right - S(12);
-    int y = transfer_rc_.top + S(12);
-
-    for (auto it = toasts_.rbegin(); it != toasts_.rend(); ++it) {
-        const ULONGLONG left = it->until > now ? it->until - now : 0;
-        const int alpha = left < 400 ? (int)(255 * left / 400) : 255;
-        if (alpha <= 4) break;
-
-        Color accent = theme::Line;
-        if (it->level == 1) accent = theme::Warn;
-        else if (it->level == 2) accent = theme::Bad;
-        else if (it->level == 3) accent = theme::Good;
-
-        const int w = std::min(S(430), TextWidth(g, it->text, f_value_) + S(40));
-        const int h = S(34);
-        RECT rc{right - w, y, right, y + h};
-
-        RoundedRect(g, rc, Color((BYTE)(235 * alpha / 255), 18, 26, 44),
-                    Color((BYTE)alpha, accent.GetR(), accent.GetG(), accent.GetB()),
-                    S(theme::Radius * 4) / 4.0f);
-
-        RECT bar{rc.left + S(8), rc.top + S(8), rc.left + S(12), rc.bottom - S(8)};
-        FillRectG(g, bar, Color((BYTE)alpha, accent.GetR(), accent.GetG(), accent.GetB()));
-
-        RECT text_rc{rc.left + S(20), rc.top, rc.right - S(10), rc.bottom};
-        TextG(g, it->text, text_rc, f_value_, Color((BYTE)alpha, 235, 240, 248));
-
-        y += h + S(6);
-        if (y > transfer_rc_.bottom - h) break;
-    }
-
-    g.ResetClip();
-}
-
 // ---------------------------------------------------------------------------
 //  Owner-draw
 // ---------------------------------------------------------------------------
