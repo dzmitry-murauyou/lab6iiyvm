@@ -836,6 +836,8 @@ struct Engine::Impl {
             SetLink(LinkScanning, L"Сканирование BLE…");
             Edit([](Stats& s) { s.scanning = true; });
             Log(0, L"Сканирование BLE запущено (active scan)");
+            Log(0, L"Приёмник Lab6 помечен в списке значком ● — у него в рекламе "
+                   L"UUID нашего сервиса");
 
             while (!scan_stop.load() && !cancel.load()) Sleep(80);
 

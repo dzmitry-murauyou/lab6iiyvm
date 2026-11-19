@@ -765,11 +765,14 @@ void View::DrawCombo(const DRAWITEMSTRUCT* item) {
                 text = buffer;
             }
         }
+        const bool ours =
+            sel >= 0 && SendMessageW(item->hwndItem, CB_GETITEMDATA, (WPARAM)sel, 0) == 1;
         RECT text_rc = item->rcItem;
         text_rc.left += S(8);
         text_rc.right -= S(22);
         TextG(g, text, text_rc, f_label_,
-              disabled ? theme::Dim : (text.empty() ? theme::Dim : theme::Txt));
+              disabled ? theme::Dim
+                       : (text.empty() ? theme::Dim : (ours ? theme::Accent : theme::Txt)));
 
         const int cx = item->rcItem.right - S(13);
         const int cy = (item->rcItem.top + item->rcItem.bottom) / 2;
@@ -782,10 +785,12 @@ void View::DrawCombo(const DRAWITEMSTRUCT* item) {
     wchar_t buffer[256] = {};
     SendMessageW(item->hwndItem, CB_GETLBTEXT, item->itemID, (LPARAM)buffer);
     const bool selected = (item->itemState & ODS_SELECTED) != 0;
+    const bool ours = SendMessageW(item->hwndItem, CB_GETITEMDATA, (WPARAM)item->itemID, 0) == 1;
     FillRectG(g, item->rcItem, selected ? theme::BtnHot : theme::Field);
     RECT text_rc = item->rcItem;
     text_rc.left += S(8);
-    TextG(g, buffer, text_rc, f_label_, selected ? theme::Txt : theme::Sub);
+    TextG(g, buffer, text_rc, f_label_,
+          ours ? theme::Accent : (selected ? theme::Txt : theme::Sub));
 }
 
 void View::DrawLogItem(const DRAWITEMSTRUCT* item) {

@@ -573,14 +573,23 @@ private:
         for (size_t index : order) {
             const ble::DeviceInfo& device = devices[index];
             // В списке только MAC: имена в рекламе бывают случайными и путают.
-            const std::wstring text = Format(L"%02X:%02X:%02X:%02X:%02X:%02X",
-                                             (unsigned)((device.address >> 40) & 0xFF),
-                                             (unsigned)((device.address >> 32) & 0xFF),
-                                             (unsigned)((device.address >> 24) & 0xFF),
-                                             (unsigned)((device.address >> 16) & 0xFF),
-                                             (unsigned)((device.address >> 8) & 0xFF),
-                                             (unsigned)(device.address & 0xFF));
-            SendMessageW(view_.DeviceCombo(), CB_ADDSTRING, 0, (LPARAM)text.c_str());
+            // Приёмник узнаём по рекламе нашего сервиса — он помечен ● и
+            // рисуется цветом акцента.
+            std::wstring text =
+                Format(L"%02X:%02X:%02X:%02X:%02X:%02X",
+                       (unsigned)((device.address >> 40) & 0xFF),
+                       (unsigned)((device.address >> 32) & 0xFF),
+                       (unsigned)((device.address >> 24) & 0xFF),
+                       (unsigned)((device.address >> 16) & 0xFF),
+                       (unsigned)((device.address >> 8) & 0xFF),
+                       (unsigned)(device.address & 0xFF));
+            if (device.has_service) text = L"\u25CF  " + text;
+            const LRESULT row =
+                SendMessageW(view_.DeviceCombo(), CB_ADDSTRING, 0, (LPARAM)text.c_str());
+            if (row != CB_ERR) {
+                SendMessageW(view_.DeviceCombo(), CB_SETITEMDATA, (WPARAM)row,
+                             (LPARAM)(device.has_service ? 1 : 0));
+            }
         }
 
         devices_count_ = order.size();
