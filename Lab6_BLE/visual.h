@@ -64,7 +64,6 @@ struct Model {
     std::wstring chunks;
     std::wstring crc;      // «1A2B3C4D → 1A2B3C4D»
     int crc_state = 0;     // 0 — нет данных, 1 — совпал, 2 — ошибка
-    std::wstring hint;     // подсказка при простое
     double progress = 0.0;
 
     std::wstring device;
@@ -158,13 +157,12 @@ private:
     // Геометрия карточек и элементов (физические пиксели).
     RECT transfer_rc_{}, session_rc_{}, file_rc_{}, log_rc_{};
     RECT title_rc_{}, subtitle_rc_{};
+    int header_right_ = 0;    // правый край шапки из Layout()
     RECT transfer_head_{}, session_head_{}, file_head_{}, log_head_{};
 
     RECT name_rc_{}, path_rc_{}, percent_rc_{}, chip_rc_{}, bar_rc_{};
     RECT cell_rc_[3]{};          // «Передано», «Скорость», «Осталось»
     RECT crc_rc_{}, graph_rc_{}, graph_head_{};
-    RECT hint_rc_{};          // подсказка в карточке «Передача»
-    RECT session_hint_rc_{};  // подсказка в карточке «Сеанс»
 
     RECT role_label_{}, device_label_{}, dir_label_{}, file_label_strip_{};
     RECT file_edit_rc_{}, separator_rc_{};
@@ -183,7 +181,6 @@ private:
     bool show_path_ = true;
     bool show_crc_ = true;
     bool show_graph_ = true;
-    bool show_hint_ = true;
     bool show_dir_label_ = true;
     unsigned int enabled_mask_ = 0xFFFFFFFFu;
 };

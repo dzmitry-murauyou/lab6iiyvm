@@ -433,6 +433,7 @@ void View::Layout() {
     session_rc_ = {w - pad - S(theme::PanelW), S(theme::HeaderH), w - pad, file_rc_.top - gap};
     transfer_rc_ = {pad, S(theme::HeaderH), session_rc_.left - gap, file_rc_.top - gap};
 
+    header_right_ = w - pad;
     title_rc_ = {pad, S(10), w - pad, S(46)};
     subtitle_rc_ = {pad, S(48), w - pad, S(70)};
 
@@ -487,8 +488,6 @@ void View::Layout() {
             graph_head_ = graph_rc_ = RECT{0, 0, 0, 0};
         }
 
-        // Подсказка при простое рисуется в области графика/полосы.
-        hint_rc_ = {left, bar_rc_.bottom + S(6), right, bottom_limit};
     }
 
     // --- карточка «Сеанс» --------------------------------------------------
@@ -524,21 +523,13 @@ void View::Layout() {
 
         const int row_h = S(theme::RowH);
         const int bottom_limit = session_rc_.bottom - S(10);
-        const int hint_h = S(24);
 
         rows_ = 3;   // Связь / RSSI / MTU — остальное ушло в журнал
-        show_hint_ = false;
-        if (bottom_limit - info_top_ >= rows_ * row_h + hint_h) {
-            show_hint_ = true;
-        } else {
-            while (rows_ > 0 && bottom_limit - info_top_ < rows_ * row_h) --rows_;
-        }
+        while (rows_ > 0 && bottom_limit - info_top_ < rows_ * row_h) --rows_;
         for (int i = 0; i < 5; ++i) {
             const int y_row = info_top_ + i * row_h;
             info_rc_[i] = {left, y_row, right, y_row + row_h};
         }
-        session_hint_rc_ = show_hint_ ? RECT{left, bottom_limit - hint_h, right, bottom_limit}
-                                       : RECT{0, 0, 0, 0};
     }
 
     // --- карточка «Файл» ---------------------------------------------------
@@ -656,14 +647,18 @@ void View::Paint(HDC dc, const RECT& client, const Model& model) {
 }
 
 void View::DrawHeader(Graphics& g, const Model& model) {
-    g.SetClip(RectF(0.0f, 0.0f, (REAL)std::max<LONG>(1, title_rc_.right), (REAL)S(theme::HeaderH)));
+    g.SetClip(RectF(0.0f, 0.0f, (REAL)std::max<LONG>(1, header_right_ + S(theme::Pad)),
+                    (REAL)S(theme::HeaderH)));
 
     const std::wstring status = model.status.empty() ? L"Не подключено" : model.status;
     const int measured = TextWidth(g, status, f_value_);
     const int max_w = S(390);
     const int status_w = std::clamp(measured + S(30), S(140), max_w);
 
-    const int status_right = title_rc_.right;
+    // Правый край берём из раскладки: раньше он читался из title_rc_, который
+    // эта же функция перезаписывала, и шапка с каждым кадром «уползала» влево.
+    const int status_right = header_right_ > 0 ? header_right_
+                                               : (int)std::max<LONG>(1, title_rc_.right);
     RECT status_rc{status_right - status_w, S(16), status_right, S(48)};
 
     const int text_right = std::max(S(theme::Pad) + S(120), (int)status_rc.left - S(20));
@@ -748,15 +743,6 @@ void View::DrawTransferCard(Graphics& g, const Model& model) {
         SpeedGraph(g, graph_rc_, model.speed_hist, f_small_);
     }
 
-    // Подсказка, когда передачи нет.
-    if (model.phase == PhaseIdle && !model.hint.empty()) {
-        RECT hint = hint_rc_;
-        const int height = S(24);
-        hint.top = std::min(hint.top + S(4), hint.bottom - height);
-        hint.bottom = std::min(hint.bottom, hint.top + height);
-        TextG(g, model.hint, hint, f_label_, theme::Sub);
-    }
-
     g.ResetClip();
 }
 
@@ -777,12 +763,6 @@ void View::DrawSessionCard(Graphics& g, const Model& model) {
     const wchar_t* labels[3] = {L"Связь:", L"RSSI:", L"MTU:"};
     for (int i = 0; i < rows_ && i < 3; ++i) {
         Row(g, session_rc_, info_rc_[i].top, labels[i], values[i], f_label_, f_value_);
-    }
-
-    if (show_hint_) {
-        TextG(g, model.sender ? L"Второй ПК: роль «Приёмник» → «Поиск» → «Подключить»"
-                              : L"Включите приём и передайте файл с другого ПК",
-              session_hint_rc_, f_small_, theme::Dim);
     }
 
     g.ResetClip();

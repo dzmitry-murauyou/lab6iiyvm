@@ -720,12 +720,6 @@ private:
         model.service = L"A1B2…4C5D";
         model.role_name = model.sender ? L"Central" : L"Peripheral";
         model.speed_hist = stats.speed_hist;
-
-        if (model.sender) {
-            model.hint = L"Выберите файл, подключитесь к приёмнику и нажмите «Отправить»";
-        } else {
-            model.hint = L"Нажмите «Старт» — второй ПК найдёт этот компьютер и пришлёт файл";
-        }
     }
 
     // -----------------------------------------------------------------------
