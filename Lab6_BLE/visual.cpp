@@ -46,7 +46,7 @@ const Color Accent(255, 94, 156, 255);
 const int Pad = 18;
 const int Gap = 10;
 const int HeaderH = 40;   // узкая полоса: только индикатор состояния
-const int LogH = 96;
+const int LogH = 168;
 const int FileH = 104;
 const int PanelW = 352;
 const int RowH = 22;
@@ -440,7 +440,7 @@ void View::Layout() {
         const int row_h = S(theme::RowH);
         const int bottom_limit = session_rc_.bottom - S(10);
 
-        rows_ = 1;   // только состояние связи
+        rows_ = 2;   // связь/MAC и (у приёмника) MAC отправителя
         while (rows_ > 0 && bottom_limit - info_top_ < rows_ * row_h) --rows_;
         for (int i = 0; i < 2; ++i) {
             const int y_row = info_top_ + i * row_h;
@@ -648,9 +648,20 @@ void View::DrawSessionCard(Graphics& g, const Model& model) {
 
     Separator(g, session_rc_, separator_y_);
 
-    const std::wstring values[1] = {model.device};
-    const wchar_t* labels[1] = {L"Связь:"};
-    for (int i = 0; i < rows_ && i < 1; ++i) {
+    // У отправителя показываем связь, у приёмника — свой MAC (адрес, на
+    // который целится Central) и MAC подключившегося отправителя.
+    std::wstring values[2];
+    const wchar_t* labels[2] = {L"Связь:", L""};
+    if (model.role == 1) {
+        labels[0] = L"Мой MAC:";
+        values[0] = model.local_mac.empty() ? L"—" : model.local_mac;
+        labels[1] = L"Отправитель:";
+        values[1] = model.peer_mac.empty() ? L"не подключён" : model.peer_mac;
+    } else {
+        values[0] = model.device;
+    }
+    for (int i = 0; i < rows_ && i < 2; ++i) {
+        if (labels[i][0] == L'\0') continue;
         Row(g, session_rc_, info_rc_[i].top, labels[i], values[i], f_label_, f_value_);
     }
 

@@ -180,7 +180,7 @@ public:
 
         hwnd_ = CreateWindowExW(0, kClassName, L"Передача файлов по Bluetooth",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                                S(1000), S(600), nullptr, nullptr, inst_, this);
+                                S(1020), S(700), nullptr, nullptr, inst_, this);
         if (!hwnd_) return false;
 
         ShowWindow(hwnd_, show);
@@ -686,6 +686,8 @@ private:
         }
 
         model.device = stats.device;
+        model.local_mac = stats.local_mac;
+        model.peer_mac = stats.peer_mac;
         model.role_name = model.sender ? L"Central" : L"Peripheral";
     }
 

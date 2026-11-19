@@ -42,6 +42,7 @@
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
+#include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.Streams.h>
@@ -55,6 +56,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -71,6 +73,7 @@ using namespace winrt;
 using namespace Windows::Devices::Bluetooth;
 using namespace Windows::Devices::Bluetooth::Advertisement;
 using namespace Windows::Devices::Bluetooth::GenericAttributeProfile;
+using namespace Windows::Devices::Enumeration;
 using namespace Windows::Storage::Streams;
 using namespace std::chrono_literals;
 
@@ -166,6 +169,27 @@ std::wstring MacText(std::uint64_t address) {
     return buffer;
 }
 
+// MAC из строки идентификатора устройства Windows:
+// «BluetoothLE#BluetoothLE<адаптер>-AA:BB:CC:DD:EE:FF». 0 — не разобрали.
+std::uint64_t MacFromDeviceId(std::wstring const& id) {
+    const std::size_t dash = id.find_last_of(L'-');
+    if (dash == std::wstring::npos || id.size() < dash + 18) return 0;
+    const std::wstring tail = id.substr(dash + 1, 17);
+    std::uint64_t mac = 0;
+    int digits = 0;
+    for (wchar_t ch : tail) {
+        if (ch == L':') continue;
+        int value = -1;
+        if (ch >= L'0' && ch <= L'9') value = ch - L'0';
+        else if (ch >= L'A' && ch <= L'F') value = ch - L'A' + 10;
+        else if (ch >= L'a' && ch <= L'f') value = ch - L'a' + 10;
+        if (value < 0) return 0;
+        mac = (mac << 4) | static_cast<std::uint64_t>(value);
+        ++digits;
+    }
+    return digits == 12 ? mac : 0;
+}
+
 // «Имя (AA:BB:CC:DD:EE:FF)» для журнала; если имени нет — только MAC.
 std::wstring MacWithName(std::uint64_t address, std::wstring const& name) {
     return name.empty() ? MacText(address)
@@ -238,6 +262,18 @@ std::wstring BluetoothErrorText(BluetoothError error) {
         case BluetoothError::DisabledByUser: return L"отключено пользователем";
         case BluetoothError::ConsentRequired: return L"требуется согласие";
         default: return Format(L"код %d", (int)error);
+    }
+}
+
+std::wstring AdvStatusText(GattServiceProviderAdvertisementStatus status) {
+    switch (status) {
+        case GattServiceProviderAdvertisementStatus::Created: return L"создана";
+        case GattServiceProviderAdvertisementStatus::Stopped: return L"остановлена";
+        case GattServiceProviderAdvertisementStatus::Started: return L"идёт";
+        case GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData:
+            return L"идёт без части данных";
+        case GattServiceProviderAdvertisementStatus::Aborted: return L"прервана";
+        default: return Format(L"код %d", (int)status);
     }
 }
 
@@ -373,6 +409,10 @@ struct Engine::Impl {
     std::atomic<bool> name_stop{false};
     std::mutex name_mu;
     std::deque<std::pair<std::uint64_t, int>> name_queue;
+    // Имена, которые Windows уже знает (кэш «Параметров»): их видно без
+    // подключения к устройству.
+    std::map<std::uint64_t, std::wstring> sys_names;
+    unsigned long long adv_count = 0;   // сколько рекламных пакетов приняли
     std::set<std::uint64_t> name_tried;
 
     std::uint64_t target = 0;
@@ -475,6 +515,40 @@ struct Engine::Impl {
     // Имя устройства: сначала системный кэш, затем GAP-характеристика 0x2A00.
     // Второй шаг требует подключения, поэтому выполняется только в фоновом
     // потоке и не для всех устройств сразу.
+    // Имя из системного кэша (то, что показывает «Параметры Windows»).
+    std::wstring SysNameFor(std::uint64_t address) {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = sys_names.find(address);
+        return it == sys_names.end() ? std::wstring() : it->second;
+    }
+
+    // Разовая загрузка имён известных системе BLE-устройств.
+    void CacheSystemNames() {
+        try {
+            auto infos = DeviceInformation::FindAllAsync(BluetoothLEDevice::GetDeviceSelector()).get();
+            int found = 0;
+            for (auto const& info : infos) {
+                const std::uint64_t mac = MacFromDeviceId(std::wstring(info.Id().c_str()));
+                const std::wstring name = info.Name().c_str();
+                if (mac == 0 || name.empty()) continue;
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    sys_names[mac] = name;
+                    for (auto& device : devices) {
+                        if (device.address == mac && device.name != name) device.name = name;
+                    }
+                }
+                ++found;
+            }
+            if (found > 0) {
+                Log(0, Format(L"Системный кэш: имена известны для %d устройств", found));
+                NotifyUi();
+            }
+        } catch (...) {
+            // Кэш — необязательный источник имён: молча продолжаем.
+        }
+    }
+
     std::wstring QueryName(std::uint64_t address, int address_type) {
         BluetoothLEDevice dev = nullptr;
         std::wstring name;
@@ -549,6 +623,9 @@ struct Engine::Impl {
     // Фоновый поток: по одному устройству, с паузой между подключениями.
     void NameWorker() {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        // Сначала — имена, которые Windows уже знает: они появляются в списке
+        // сразу, без подключения к устройствам.
+        CacheSystemNames();
         while (!name_stop.load()) {
             std::pair<std::uint64_t, int> item{0, 0};
             bool have = false;
@@ -631,7 +708,10 @@ struct Engine::Impl {
         }
 
         try {
-            Log(0, Format(L"Адаптер MAC: %s", MacText(adapter.BluetoothAddress()).c_str()));
+            const std::wstring mac = MacText(adapter.BluetoothAddress());
+            Edit([&](Stats& s) { s.local_mac = mac; });
+            Log(0, Format(L"Адаптер MAC: %s%s", mac.c_str(),
+                          need_peripheral ? L" — на этот адрес отправляет Central" : L""));
         } catch (...) {
         }
 
@@ -700,6 +780,18 @@ struct Engine::Impl {
 
             while (!scan_stop.load() && !cancel.load()) Sleep(80);
 
+            {
+                unsigned long long packets = 0;
+                std::size_t known = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    packets = adv_count;
+                    known = devices.size();
+                }
+                Log(0, Format(L"Сканирование завершено: пакетов %d, устройств в списке %d",
+                              (int)packets, (int)known));
+            }
+
             watcher.Stop();
             try {
                 watcher.Received(received);
@@ -740,10 +832,13 @@ struct Engine::Impl {
         } catch (...) {
         }
 
+        if (name.empty()) name = SysNameFor(address);
+
         bool added = false;
         bool marked = false;
         {
             std::lock_guard<std::mutex> lock(mu);
+            ++adv_count;
             DeviceInfo* found = nullptr;
             for (auto& device : devices) {
                 if (device.address == address) {
@@ -897,7 +992,19 @@ struct Engine::Impl {
         inbox.clear();
     }
 
+    // Тип адреса в рекламе иногда приходит как Unspecified, а некоторые
+    // адаптеры отдают random/public наоборот. Поэтому пробуем оба варианта:
+    // сначала заявленный, затем второй.
     bool TryConnect(std::uint64_t address, int address_type) {
+        const int first = address_type == 1 ? 1 : 0;
+        if (TryConnectWith(address, first)) return true;
+        if (cancel.load()) return false;
+        Log(1, Format(L"Повтор подключения к MAC %s с типом адреса %s", MacText(address).c_str(),
+                      first == 1 ? L"public" : L"random"));
+        return TryConnectWith(address, 1 - first);
+    }
+
+    bool TryConnectWith(std::uint64_t address, int address_type) {
         ResetLink();
 
         SetLink(LinkConnecting, L"Подключение…");
@@ -915,10 +1022,16 @@ struct Engine::Impl {
             // (random) адресом, и подключение по одному числу не сработает.
             const BluetoothAddressType type =
                 address_type == 1 ? BluetoothAddressType::Random : BluetoothAddressType::Public;
-            BluetoothLEDevice dev = BluetoothLEDevice::FromBluetoothAddressAsync(address, type).get();
+            // Сразу после сканирования устройство бывает ещё не готово к
+            // подключению — несколько попыток с паузой заметно надёжнее.
+            BluetoothLEDevice dev = nullptr;
+            for (int attempt = 0; attempt < 3 && !dev; ++attempt) {
+                dev = BluetoothLEDevice::FromBluetoothAddressAsync(address, type).get();
+                if (!dev && attempt < 2) SleepCancelable(400);
+            }
             if (!dev) {
                 Log(2, L"Устройство MAC " + MacText(address) +
-                           L" не найдено (возможно, выключено)");
+                           L" не найдено (возможно, выключено или вне зоны)");
                 return false;
             }
 
@@ -931,15 +1044,41 @@ struct Engine::Impl {
                            MacText(address));
             }
 
+            // Кэш GATT на Windows бывает «пустым» сразу после подключения:
+            // пробуем Uncached, затем Cached, затем перебор всех сервисов.
             GattDeviceService svc = nullptr;
             for (int attempt = 0; attempt < 3 && !svc; ++attempt) {
-                auto result = dev.GetGattServicesForUuidAsync(ServiceUuid(),
-                                                             BluetoothCacheMode::Uncached).get();
-                if (result.Status() == GattCommunicationStatus::Success &&
-                    result.Services().Size() > 0) {
-                    svc = result.Services().GetAt(0);
-                } else if (attempt < 2) {
-                    SleepCancelable(400);
+                const BluetoothCacheMode mode =
+                    attempt == 0 ? BluetoothCacheMode::Uncached : BluetoothCacheMode::Cached;
+                GattCommunicationStatus status = GattCommunicationStatus::Unreachable;
+                try {
+                    auto result = dev.GetGattServicesForUuidAsync(ServiceUuid(), mode).get();
+                    status = result.Status();
+                    if (status == GattCommunicationStatus::Success &&
+                        result.Services().Size() > 0) {
+                        svc = result.Services().GetAt(0);
+                    }
+                    if (!svc) {
+                        auto all = dev.GetGattServicesAsync(mode).get();
+                        status = all.Status();
+                        if (status == GattCommunicationStatus::Success) {
+                            for (auto const& candidate : all.Services()) {
+                                if (candidate.Uuid() == ServiceUuid()) {
+                                    svc = candidate;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (hresult_error const& e) {
+                    Log(1, Format(L"Поиск сервиса на MAC %s: %s (попытка %d)",
+                                  MacText(address).c_str(), e.message().c_str(), attempt + 1));
+                }
+                if (!svc) {
+                    Log(1, Format(L"Сервис пока не найден (MAC %s, попытка %d): %s",
+                                  MacText(address).c_str(), attempt + 1,
+                                  CommStatusText(status).c_str()));
+                    if (attempt < 2) SleepCancelable(400);
                 }
             }
             if (!svc) {
@@ -950,6 +1089,9 @@ struct Engine::Impl {
             }
 
             auto chars = svc.GetCharacteristicsAsync(BluetoothCacheMode::Uncached).get();
+            if (chars.Status() != GattCommunicationStatus::Success) {
+                chars = svc.GetCharacteristicsAsync(BluetoothCacheMode::Cached).get();
+            }
             if (chars.Status() != GattCommunicationStatus::Success) {
                 Log(2, Format(L"Не удалось получить характеристики на MAC %s: %s",
                               MacText(address).c_str(), CommStatusText(chars.Status()).c_str()));
@@ -1159,6 +1301,11 @@ struct Engine::Impl {
     std::uint64_t LinkAddress() {
         std::lock_guard<std::mutex> lock(snd_mu);
         return link_address;
+    }
+
+    std::wstring LocalMac() {
+        std::lock_guard<std::mutex> lock(mu);
+        return stats.local_mac;
     }
 
     bool WriteControl(std::wstring const& line) {
@@ -1635,6 +1782,12 @@ struct Engine::Impl {
         return L"идентификатор Central недоступен";
     }
 
+    // Короткий MAC Central (из строки идентификатора) — для строки в окне.
+    std::wstring CentralMac() {
+        const std::uint64_t mac = MacFromDeviceId(CentralText());
+        return mac == 0 ? std::wstring() : MacText(mac);
+    }
+
     void OnStatusRead(GattReadRequestedEventArgs const& args) {
         auto deferral = args.GetDeferral();
         try {
@@ -1672,7 +1825,9 @@ struct Engine::Impl {
 
         if (has_client) {
             Log(3, L"Central подключился к GATT-серверу · " + CentralText());
-            Edit([](Stats& s) {
+            const std::wstring central_mac = CentralMac();
+            Edit([&](Stats& s) {
+                s.peer_mac = central_mac;
                 s.connected = true;
                 s.link = s.transfer == TrReceiving ? LinkTransfer : LinkReady;
                 s.status = L"Central подключён";
@@ -1681,6 +1836,7 @@ struct Engine::Impl {
             Log(1, L"Central отключился — сеанс сохранён для возобновления · " + CentralText());
             Edit([](Stats& s) {
                 s.connected = false;
+                s.peer_mac.clear();
                 if (s.transfer == TrReceiving) {
                     s.transfer = TrPaused;
                     s.status = L"Связь потеряна — ждём повторного подключения";
@@ -2110,6 +2266,19 @@ struct Engine::Impl {
             advertising.IsConnectable(true);
             advertising.IsDiscoverable(true);
             provider_local.StartAdvertising(advertising);
+
+            // Реклама включается не мгновенно: коротко ждём статус «идёт» и
+            // пишем его в журнал — если рекламы нет, отсюда это сразу видно.
+            GattServiceProviderAdvertisementStatus adv_status =
+                provider_local.AdvertisementStatus();
+            for (int i = 0; i < 20; ++i) {
+                if (adv_status == GattServiceProviderAdvertisementStatus::Started) break;
+                Sleep(100);
+                adv_status = provider_local.AdvertisementStatus();
+            }
+            Log(adv_status == GattServiceProviderAdvertisementStatus::Started ? 3 : 2,
+                Format(L"Реклама: %s · мой MAC %s", AdvStatusText(adv_status).c_str(),
+                      LocalMac().c_str()));
 
             Log(3, L"GATT-сервис опубликован. Идёт BLE-реклама — ожидание Central…");
             Edit([](Stats& s) {

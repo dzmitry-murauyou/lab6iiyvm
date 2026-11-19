@@ -64,6 +64,8 @@ struct Model {
     double progress = 0.0;
 
     std::wstring device;
+    std::wstring local_mac;   // MAC своего адаптера (приёмник — адрес для отправки)
+    std::wstring peer_mac;    // MAC второй стороны
     std::wstring role_name;
 
     bool has_devices = false;

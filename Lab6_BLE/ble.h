@@ -89,6 +89,9 @@ struct Stats {
     unsigned int crc_actual = 0;
     bool crc_ok = false;
 
+    std::wstring local_mac;   // MAC своего адаптера (в приёмнике — адрес для отправки)
+    std::wstring peer_mac;    // MAC второй стороны (Central в режиме приёмника)
+
     bool scanning = false;
     bool connected = false;
     std::vector<float> speed_hist;   // история скорости, байт/с (до 160 точек)
